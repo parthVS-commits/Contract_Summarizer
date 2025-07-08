@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import PyPDF2
 import docx
 from PIL import Image
-import pytesseract
+import pytesseract  # Keep for image files only
 import io
 import json
 import re
@@ -185,18 +185,6 @@ def extract_text_with_openai_vision(img_base64: str, page_num: int) -> Optional[
         st.warning(f"⚠️ OpenAI Vision failed for page {page_num}: {str(e)}")
         return None
 
-def process_pdf_page_ocr(page_data: tuple) -> str:
-    """Process a single PDF page with OCR (for threading)"""
-    page_num, img_data = page_data
-    try:
-        image = Image.open(io.BytesIO(img_data))
-        page_text = pytesseract.image_to_string(image, config='--psm 6')
-        logger.info(f"OCR thread: Page {page_num + 1} extracted {len(page_text)} characters")
-        return page_text
-    except Exception as e:
-        logger.error(f"OCR thread: Error processing page {page_num + 1}: {str(e)}")
-        return ""
-
 def process_pdf_page_vision(page_data: tuple) -> str:
     """Process a single PDF page with OpenAI Vision (for threading)"""
     page_num, img_data = page_data
@@ -210,32 +198,32 @@ def process_pdf_page_vision(page_data: tuple) -> str:
         return ""
 
 def extract_text_from_file_threaded(uploaded_file) -> Optional[str]:
-    """Extract text from various file formats with threading support"""
+    """Extract text from various file formats with 2-layer approach: PyMuPDF → OpenAI Vision"""
     file_type = uploaded_file.type
     file_name = uploaded_file.name
     file_size = uploaded_file.size
     
-    logger.info(f"Starting threaded text extraction from file: {file_name}")
+    logger.info(f"Starting 2-layer text extraction from file: {file_name}")
     logger.info(f"File type: {file_type}, Size: {file_size} bytes")
     
     text = ""
     
     try:
         if file_type == "application/pdf":
-            logger.info("Processing PDF file with threading...")
+            logger.info("Processing PDF file with 2-layer approach (PyMuPDF → Vision)...")
             
-            # First try PyMuPDF for better PDF handling
+            # Try PyMuPDF for better PDF handling
             try:
                 import fitz  # PyMuPDF
-                logger.info("Using PyMuPDF with threading for PDF processing")
+                logger.info("Using PyMuPDF with 2-layer approach for PDF processing")
                 
                 # Read the uploaded file
                 pdf_data = uploaded_file.read()
                 pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
                 page_count = len(pdf_document)
-                logger.info(f"PDF has {page_count} pages - preparing for threaded processing")
+                logger.info(f"PDF has {page_count} pages - preparing for 2-layer processing")
                 
-                # Try text extraction first
+                # Layer 1: Try text extraction first
                 text_pages = []
                 for page_num in range(page_count):
                     page = pdf_document.load_page(page_num)
@@ -246,31 +234,9 @@ def extract_text_from_file_threaded(uploaded_file) -> Optional[str]:
                 logger.info(f"PyMuPDF text extraction: {len(text)} characters")
                 extraction_method_used = "PyMuPDF Text Extraction"
                 
-                # If minimal text, use threaded OCR
-                if len(text.strip()) < 100:
-                    logger.warning("Minimal text from PyMuPDF, using threaded OCR processing")
-                    text = ""
-                    extraction_method_used = "PyMuPDF + Threaded OCR"
-                    
-                    # Prepare page data for threading
-                    page_data_list = []
-                    for page_num in range(page_count):
-                        page = pdf_document.load_page(page_num)
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-                        img_data = pix.tobytes("png")
-                        page_data_list.append((page_num, img_data))
-                    
-                    # Process pages in parallel using ThreadPoolExecutor
-                    logger.info(f"Starting threaded OCR for {page_count} pages")
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, page_count)) as executor:
-                        page_texts = list(executor.map(process_pdf_page_ocr, page_data_list))
-                    
-                    text = "\n".join(page_texts)
-                    logger.info(f"Threaded OCR completed: {len(text)} characters")
-                
-                # If still minimal text, use threaded OpenAI Vision
-                if len(text.strip()) < 200:
-                    logger.warning("OCR results poor, using threaded OpenAI Vision API")
+                # Layer 2: If minimal text, use threaded OpenAI Vision directly
+                if len(text.strip()) < 150:  # Adjusted threshold
+                    logger.warning("Minimal text from PyMuPDF, using threaded OpenAI Vision API directly")
                     text = ""
                     extraction_method_used = "Threaded OpenAI Vision API"
                     
@@ -291,7 +257,7 @@ def extract_text_from_file_threaded(uploaded_file) -> Optional[str]:
                     logger.info(f"Threaded Vision API completed: {len(text)} characters")
                 
                 pdf_document.close()
-                logger.info(f"Threaded PDF extraction completed: {len(text)} characters using {extraction_method_used}")
+                logger.info(f"2-layer PDF extraction completed: {len(text)} characters using {extraction_method_used}")
                 
                 # Store the extraction method for display
                 if 'extraction_method' not in st.session_state:
@@ -302,7 +268,7 @@ def extract_text_from_file_threaded(uploaded_file) -> Optional[str]:
                 return extract_text_from_file(uploaded_file)  # Fallback to original method
             
             except Exception as e:
-                logger.error(f"Error in threaded PDF processing: {str(e)}")
+                logger.error(f"Error in 2-layer PDF processing: {str(e)}")
                 st.error(f"❌ Error processing PDF: {str(e)}")
                 return None
                 
@@ -317,31 +283,31 @@ def extract_text_from_file_threaded(uploaded_file) -> Optional[str]:
             st.warning("⚠️ No text content found in the uploaded file")
             return None
         
-        logger.info(f"Threaded text extraction completed successfully. Total characters: {len(text)}")
+        logger.info(f"2-layer text extraction completed successfully. Total characters: {len(text)}")
         return text
             
     except Exception as e:
-        error_msg = f"Error in threaded extraction from {file_name}: {str(e)}"
+        error_msg = f"Error in 2-layer extraction from {file_name}: {str(e)}"
         logger.error(error_msg)
         st.error(f"❌ {error_msg}")
         return None
 
 def extract_text_from_file(uploaded_file) -> Optional[str]:
-    """Extract text from various file formats with comprehensive logging"""
+    """Extract text from various file formats with 2-layer approach: PyMuPDF → OpenAI Vision"""
     file_type = uploaded_file.type
     file_name = uploaded_file.name
     file_size = uploaded_file.size
     
-    logger.info(f"Starting text extraction from file: {file_name}")
+    logger.info(f"Starting 2-layer text extraction from file: {file_name}")
     logger.info(f"File type: {file_type}, Size: {file_size} bytes")
     
     text = ""
     
     try:
         if file_type == "application/pdf":
-            logger.info("Processing PDF file...")
+            logger.info("Processing PDF file with 2-layer approach...")
             
-            # First try PyMuPDF for better PDF handling
+            # Try PyMuPDF for better PDF handling
             try:
                 import fitz  # PyMuPDF
                 logger.info("Using PyMuPDF for PDF processing")
@@ -352,7 +318,7 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
                 page_count = len(pdf_document)
                 logger.info(f"PDF has {page_count} pages")
                 
-                # Try text extraction first
+                # Layer 1: Try text extraction first
                 for page_num in range(page_count):
                     page = pdf_document.load_page(page_num)
                     page_text = page.get_text()
@@ -362,26 +328,9 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
                 logger.info(f"PyMuPDF text extraction: {len(text)} characters")
                 extraction_method_used = "PyMuPDF Text Extraction"
                 
-                # If minimal text, try OCR
-                if len(text.strip()) < 100:
-                    logger.warning("Minimal text from PyMuPDF, using OCR on PDF pages")
-                    text = ""  # Reset
-                    extraction_method_used = "PyMuPDF + OCR"
-                    
-                    for page_num in range(page_count):
-                        page = pdf_document.load_page(page_num)
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # Higher resolution
-                        img_data = pix.tobytes("png")
-                        image = Image.open(io.BytesIO(img_data))
-                        
-                        logger.info(f"Running OCR on page {page_num + 1}")
-                        page_text = pytesseract.image_to_string(image, config='--psm 6')
-                        text += page_text + "\n"
-                        logger.info(f"OCR extracted {len(page_text)} characters from page {page_num + 1}")
-                
-                # If still minimal text, fallback to OpenAI Vision
-                if len(text.strip()) < 200:
-                    logger.warning("OCR results poor, falling back to OpenAI Vision API")
+                # Layer 2: If minimal text, use OpenAI Vision directly
+                if len(text.strip()) < 150:  # Adjusted threshold
+                    logger.warning("Minimal text from PyMuPDF, using OpenAI Vision API directly")
                     text = ""  # Reset
                     extraction_method_used = "OpenAI Vision API"
                     
@@ -411,16 +360,16 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
                     status_text.empty()
                 
                 pdf_document.close()
-                logger.info(f"Final PyMuPDF extraction completed: {len(text)} characters using {extraction_method_used}")
+                logger.info(f"Final 2-layer extraction completed: {len(text)} characters using {extraction_method_used}")
                 
                 # Store the extraction method for display
                 if 'extraction_method' not in st.session_state:
                     st.session_state.extraction_method = extraction_method_used
                 
             except ImportError:
-                logger.warning("PyMuPDF not available, falling back to PyPDF2 + OCR")
+                logger.warning("PyMuPDF not available, falling back to PyPDF2")
                 
-                # Fallback to original PyPDF2 method
+                # Fallback to PyPDF2 method (basic)
                 uploaded_file.seek(0)  # Reset file pointer
                 pdf_reader = PyPDF2.PdfReader(uploaded_file)
                 page_count = len(pdf_reader.pages)
@@ -435,8 +384,8 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
                 st.session_state.extraction_method = "PyPDF2 (Basic)"
                 
                 # If minimal text with PyPDF2, suggest installing PyMuPDF
-                if len(text.strip()) < 100:
-                    logger.error("Minimal text extraction with PyPDF2. Install PyMuPDF for better scanned PDF support")
+                if len(text.strip()) < 150:
+                    logger.error("Minimal text extraction with PyPDF2. Install PyMuPDF for better support")
                     st.error("❌ This appears to be a scanned PDF. For better extraction, install PyMuPDF:")
                     st.code("pip install PyMuPDF")
             
@@ -481,7 +430,7 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
             st.warning("⚠️ No text content found in the uploaded file")
             return None
         
-        logger.info(f"Text extraction completed successfully. Total characters: {len(text)}")
+        logger.info(f"2-layer text extraction completed successfully. Total characters: {len(text)}")
         return text
             
     except Exception as e:
@@ -1844,14 +1793,14 @@ def main():
             
             # Show extraction method being used
             if uploaded_file.type == "application/pdf":
-                extraction_method = "🚀 Threaded PDF Processing: PyMuPDF → Parallel OCR → Parallel Vision API"
+                extraction_method = "🚀 2-Layer Processing: PyMuPDF → OpenAI Vision API (No OCR)"
             else:
                 extraction_method = "📄 Standard Processing for Non-PDF Files"
             
             st.info(f"🔄 **Extraction Method:** {extraction_method}")
             
             # Process the document with optimized extraction
-            with st.spinner("🚀 Processing document with optimized extraction..."):
+            with st.spinner("🚀 Processing document with 2-layer extraction..."):
                 # Create a progress placeholder
                 progress_placeholder = st.empty()
                 status_placeholder = st.empty()
@@ -1865,10 +1814,10 @@ def main():
                     # For PDFs, try threaded processing if PyMuPDF available
                     try:
                         import fitz
-                        status_placeholder.info("🚀 **Using threaded PDF processing...**")
+                        status_placeholder.info("🚀 **Using 2-layer threaded PDF processing...**")
                         document_text = extract_text_from_file_threaded(uploaded_file)
                     except ImportError:
-                        status_placeholder.info("📄 **Using standard PDF processing...**")
+                        status_placeholder.info("📄 **Using 2-layer standard PDF processing...**")
                         document_text = extract_text_from_file(uploaded_file)
                 else:
                     # For non-PDFs, use standard processing
@@ -2003,27 +1952,6 @@ def main():
         logger.info("No file uploaded yet")
         st.info("👆 Please select document type and upload a contract to get started")
         
-        # Show supported formats
-        with st.expander("📋 Supported Document Types & Formats"):
-            st.markdown("""
-            **📄 Document Types:**
-            - **🏠 Rental Agreements** - Lease contracts, property rentals, commercial leases
-            - **🔒 NDAs** - Non-disclosure agreements, confidentiality contracts
-            - **📋 MSAs** - Master service agreements, service contracts, vendor agreements
-            
-            **📁 File Formats:**
-            - **PDF files** (.pdf) - Including scanned documents with OCR
-            - **Word documents** (.docx) - Microsoft Word format
-            - **Text files** (.txt) - Plain text format
-            - **Images** (.jpg, .jpeg, .png, .tiff) - Uses OCR for text extraction
-            """)
-            
-            st.markdown("""
-            **🎯 What We Extract:**
-            - **Rental:** Parties, property details, rent amounts, lease terms, dates
-            - **NDA:** Confidentiality scope, parties, duration, obligations, restrictions  
-            - **MSA:** Service details, payment terms, parties, termination clauses
-            """)
     
     
 if __name__ == "__main__":
