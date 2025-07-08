@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import PyPDF2
 import docx
 from PIL import Image
+import pytesseract
 import io
 import json
 import re
@@ -14,6 +15,9 @@ import os
 from dotenv import load_dotenv
 import logging
 from typing import Optional, Dict, Any
+import threading
+import concurrent.futures
+from functools import partial
 
 # Configure logging
 logging.basicConfig(
@@ -181,55 +185,265 @@ def extract_text_with_openai_vision(img_base64: str, page_num: int) -> Optional[
         st.warning(f"⚠️ OpenAI Vision failed for page {page_num}: {str(e)}")
         return None
 
+def process_pdf_page_ocr(page_data: tuple) -> str:
+    """Process a single PDF page with OCR (for threading)"""
+    page_num, img_data = page_data
+    try:
+        image = Image.open(io.BytesIO(img_data))
+        page_text = pytesseract.image_to_string(image, config='--psm 6')
+        logger.info(f"OCR thread: Page {page_num + 1} extracted {len(page_text)} characters")
+        return page_text
+    except Exception as e:
+        logger.error(f"OCR thread: Error processing page {page_num + 1}: {str(e)}")
+        return ""
 
+def process_pdf_page_vision(page_data: tuple) -> str:
+    """Process a single PDF page with OpenAI Vision (for threading)"""
+    page_num, img_data = page_data
+    try:
+        img_base64 = base64.b64encode(img_data).decode('utf-8')
+        page_text = extract_text_with_openai_vision(img_base64, page_num + 1)
+        logger.info(f"Vision thread: Page {page_num + 1} extracted {len(page_text or '')} characters")
+        return page_text or ""
+    except Exception as e:
+        logger.error(f"Vision thread: Error processing page {page_num + 1}: {str(e)}")
+        return ""
 
-def extract_text_from_file_simple(uploaded_file) -> Optional[str]:
-    """Simplified text extraction - PyPDF2 for text-based PDFs, skip scanned PDFs"""
+def extract_text_from_file_threaded(uploaded_file) -> Optional[str]:
+    """Extract text from various file formats with threading support"""
     file_type = uploaded_file.type
     file_name = uploaded_file.name
     file_size = uploaded_file.size
     
-    logger.info(f"Starting simplified text extraction from file: {file_name}")
+    logger.info(f"Starting threaded text extraction from file: {file_name}")
     logger.info(f"File type: {file_type}, Size: {file_size} bytes")
     
     text = ""
     
     try:
         if file_type == "application/pdf":
-            logger.info("Processing PDF with simplified method...")
+            logger.info("Processing PDF file with threading...")
             
-            # Use PyPDF2 only (simple and reliable)
-            pdf_reader = PyPDF2.PdfReader(uploaded_file)
-            page_count = len(pdf_reader.pages)
-            logger.info(f"PDF has {page_count} pages")
-            
-            # Extract text from all pages
-            for i, page in enumerate(pdf_reader.pages):
-                page_text = page.extract_text()
-                text += page_text + "\n"
-                logger.debug(f"Extracted {len(page_text)} characters from page {i+1}")
-            
-            logger.info(f"PyPDF2 extraction completed: {len(text)} characters")
-            
-            # If we got substantial text, we're done
-            if len(text.strip()) > 200:
-                logger.info("Sufficient text extracted with PyPDF2")
-                st.session_state.extraction_method = "PyPDF2 (Text-based PDF)"
-                return text
-            else:
-                # If minimal text, it's likely a scanned PDF
-                logger.warning("Minimal text from PyPDF2, this appears to be a scanned PDF")
-                st.error("🚫 **Scanned PDF Detected**")
-                st.warning("This appears to be a scanned PDF (image-based). For best results, please:")
-                st.info("📝 **Option 1:** Upload a text-based PDF (created digitally, not scanned)")
-                st.info("📄 **Option 2:** Convert to Word document (.docx) and upload that")
-                st.info("🖼️ **Option 3:** Upload individual pages as image files (.jpg, .png)")
+            # First try PyMuPDF for better PDF handling
+            try:
+                import fitz  # PyMuPDF
+                logger.info("Using PyMuPDF with threading for PDF processing")
                 
-                # Offer to proceed anyway with limited processing
-                if st.button("⚡ **Try AI Vision anyway** (may take time and use more resources)"):
-                    return process_scanned_pdf_with_vision(uploaded_file, page_count)
-                else:
-                    return None
+                # Read the uploaded file
+                pdf_data = uploaded_file.read()
+                pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
+                page_count = len(pdf_document)
+                logger.info(f"PDF has {page_count} pages - preparing for threaded processing")
+                
+                # Try text extraction first
+                text_pages = []
+                for page_num in range(page_count):
+                    page = pdf_document.load_page(page_num)
+                    page_text = page.get_text()
+                    text_pages.append(page_text)
+                
+                text = "\n".join(text_pages)
+                logger.info(f"PyMuPDF text extraction: {len(text)} characters")
+                extraction_method_used = "PyMuPDF Text Extraction"
+                
+                # If minimal text, use threaded OCR
+                if len(text.strip()) < 100:
+                    logger.warning("Minimal text from PyMuPDF, using threaded OCR processing")
+                    text = ""
+                    extraction_method_used = "PyMuPDF + Threaded OCR"
+                    
+                    # Prepare page data for threading
+                    page_data_list = []
+                    for page_num in range(page_count):
+                        page = pdf_document.load_page(page_num)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                        img_data = pix.tobytes("png")
+                        page_data_list.append((page_num, img_data))
+                    
+                    # Process pages in parallel using ThreadPoolExecutor
+                    logger.info(f"Starting threaded OCR for {page_count} pages")
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, page_count)) as executor:
+                        page_texts = list(executor.map(process_pdf_page_ocr, page_data_list))
+                    
+                    text = "\n".join(page_texts)
+                    logger.info(f"Threaded OCR completed: {len(text)} characters")
+                
+                # If still minimal text, use threaded OpenAI Vision
+                if len(text.strip()) < 200:
+                    logger.warning("OCR results poor, using threaded OpenAI Vision API")
+                    text = ""
+                    extraction_method_used = "Threaded OpenAI Vision API"
+                    
+                    # Prepare page data for Vision API threading
+                    page_data_list = []
+                    for page_num in range(page_count):
+                        page = pdf_document.load_page(page_num)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                        img_data = pix.tobytes("png")
+                        page_data_list.append((page_num, img_data))
+                    
+                    # Process pages in parallel (limited workers for API rate limits)
+                    logger.info(f"Starting threaded OpenAI Vision for {page_count} pages")
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, page_count)) as executor:
+                        page_texts = list(executor.map(process_pdf_page_vision, page_data_list))
+                    
+                    text = "\n".join(filter(None, page_texts))  # Filter out None/empty results
+                    logger.info(f"Threaded Vision API completed: {len(text)} characters")
+                
+                pdf_document.close()
+                logger.info(f"Threaded PDF extraction completed: {len(text)} characters using {extraction_method_used}")
+                
+                # Store the extraction method for display
+                if 'extraction_method' not in st.session_state:
+                    st.session_state.extraction_method = extraction_method_used
+                
+            except ImportError:
+                logger.warning("PyMuPDF not available, falling back to PyPDF2 (no threading)")
+                return extract_text_from_file(uploaded_file)  # Fallback to original method
+            
+            except Exception as e:
+                logger.error(f"Error in threaded PDF processing: {str(e)}")
+                st.error(f"❌ Error processing PDF: {str(e)}")
+                return None
+                
+        else:
+            # For non-PDF files, use the original method (no threading needed)
+            logger.info("Non-PDF file detected, using standard extraction")
+            uploaded_file.seek(0)  # Reset file pointer
+            return extract_text_from_file(uploaded_file)
+        
+        if len(text.strip()) == 0:
+            logger.warning("No text content extracted from file")
+            st.warning("⚠️ No text content found in the uploaded file")
+            return None
+        
+        logger.info(f"Threaded text extraction completed successfully. Total characters: {len(text)}")
+        return text
+            
+    except Exception as e:
+        error_msg = f"Error in threaded extraction from {file_name}: {str(e)}"
+        logger.error(error_msg)
+        st.error(f"❌ {error_msg}")
+        return None
+
+def extract_text_from_file(uploaded_file) -> Optional[str]:
+    """Extract text from various file formats with comprehensive logging"""
+    file_type = uploaded_file.type
+    file_name = uploaded_file.name
+    file_size = uploaded_file.size
+    
+    logger.info(f"Starting text extraction from file: {file_name}")
+    logger.info(f"File type: {file_type}, Size: {file_size} bytes")
+    
+    text = ""
+    
+    try:
+        if file_type == "application/pdf":
+            logger.info("Processing PDF file...")
+            
+            # First try PyMuPDF for better PDF handling
+            try:
+                import fitz  # PyMuPDF
+                logger.info("Using PyMuPDF for PDF processing")
+                
+                # Read the uploaded file
+                pdf_data = uploaded_file.read()
+                pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
+                page_count = len(pdf_document)
+                logger.info(f"PDF has {page_count} pages")
+                
+                # Try text extraction first
+                for page_num in range(page_count):
+                    page = pdf_document.load_page(page_num)
+                    page_text = page.get_text()
+                    text += page_text + "\n"
+                    logger.debug(f"Extracted {len(page_text)} characters from page {page_num + 1}")
+                
+                logger.info(f"PyMuPDF text extraction: {len(text)} characters")
+                extraction_method_used = "PyMuPDF Text Extraction"
+                
+                # If minimal text, try OCR
+                if len(text.strip()) < 100:
+                    logger.warning("Minimal text from PyMuPDF, using OCR on PDF pages")
+                    text = ""  # Reset
+                    extraction_method_used = "PyMuPDF + OCR"
+                    
+                    for page_num in range(page_count):
+                        page = pdf_document.load_page(page_num)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # Higher resolution
+                        img_data = pix.tobytes("png")
+                        image = Image.open(io.BytesIO(img_data))
+                        
+                        logger.info(f"Running OCR on page {page_num + 1}")
+                        page_text = pytesseract.image_to_string(image, config='--psm 6')
+                        text += page_text + "\n"
+                        logger.info(f"OCR extracted {len(page_text)} characters from page {page_num + 1}")
+                
+                # If still minimal text, fallback to OpenAI Vision
+                if len(text.strip()) < 200:
+                    logger.warning("OCR results poor, falling back to OpenAI Vision API")
+                    text = ""  # Reset
+                    extraction_method_used = "OpenAI Vision API"
+                    
+                    # Show progress for OpenAI Vision
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    for page_num in range(page_count):
+                        status_text.text(f"🤖 Processing page {page_num + 1}/{page_count} with OpenAI Vision...")
+                        progress_bar.progress((page_num + 1) / page_count)
+                        
+                        page = pdf_document.load_page(page_num)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                        img_data = pix.tobytes("png")
+                        
+                        # Convert to base64 for OpenAI
+                        img_base64 = base64.b64encode(img_data).decode('utf-8')
+                        
+                        logger.info(f"Using OpenAI Vision API for page {page_num + 1}")
+                        page_text = extract_text_with_openai_vision(img_base64, page_num + 1)
+                        if page_text:
+                            text += page_text + "\n"
+                            logger.info(f"OpenAI Vision extracted {len(page_text)} characters from page {page_num + 1}")
+                    
+                    # Clear progress indicators
+                    progress_bar.empty()
+                    status_text.empty()
+                
+                pdf_document.close()
+                logger.info(f"Final PyMuPDF extraction completed: {len(text)} characters using {extraction_method_used}")
+                
+                # Store the extraction method for display
+                if 'extraction_method' not in st.session_state:
+                    st.session_state.extraction_method = extraction_method_used
+                
+            except ImportError:
+                logger.warning("PyMuPDF not available, falling back to PyPDF2 + OCR")
+                
+                # Fallback to original PyPDF2 method
+                uploaded_file.seek(0)  # Reset file pointer
+                pdf_reader = PyPDF2.PdfReader(uploaded_file)
+                page_count = len(pdf_reader.pages)
+                logger.info(f"PDF has {page_count} pages (PyPDF2 fallback)")
+                
+                for i, page in enumerate(pdf_reader.pages):
+                    page_text = page.extract_text()
+                    text += page_text + "\n"
+                    logger.debug(f"Extracted {len(page_text)} characters from page {i+1}")
+                
+                logger.info(f"PyPDF2 extraction completed: {len(text)} characters")
+                st.session_state.extraction_method = "PyPDF2 (Basic)"
+                
+                # If minimal text with PyPDF2, suggest installing PyMuPDF
+                if len(text.strip()) < 100:
+                    logger.error("Minimal text extraction with PyPDF2. Install PyMuPDF for better scanned PDF support")
+                    st.error("❌ This appears to be a scanned PDF. For better extraction, install PyMuPDF:")
+                    st.code("pip install PyMuPDF")
+            
+            except Exception as e:
+                logger.error(f"Error in PDF processing: {str(e)}")
+                st.error(f"❌ Error processing PDF: {str(e)}")
+                return None
                 
         elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             logger.info("Processing DOCX file...")
@@ -242,30 +456,19 @@ def extract_text_from_file_simple(uploaded_file) -> Optional[str]:
                 logger.debug(f"Processed paragraph {i+1}")
             
             logger.info(f"Successfully extracted {len(text)} characters from DOCX")
-            st.session_state.extraction_method = "DOCX Processing"
                 
         elif file_type in ["image/jpeg", "image/jpg", "image/png", "image/tiff"]:
-            logger.info(f"Processing image file with AI Vision: {file_type}")
+            logger.info(f"Processing image file with OCR: {file_type}")
+            image = Image.open(uploaded_file)
+            logger.info(f"Image dimensions: {image.size}")
             
-            # Convert image to base64
-            image_data = uploaded_file.read()
-            img_base64 = base64.b64encode(image_data).decode('utf-8')
-            
-            st.info("🤖 **Processing image with AI Vision...**")
-            text = extract_text_with_openai_vision(img_base64, 1)
-            
-            if text:
-                logger.info(f"AI Vision extraction completed: {len(text)} characters extracted")
-                st.session_state.extraction_method = "OpenAI Vision API (Image)"
-            else:
-                logger.warning("AI Vision failed to extract text from image")
-                text = ""
+            text = pytesseract.image_to_string(image)
+            logger.info(f"OCR extraction completed: {len(text)} characters extracted")
             
         elif file_type == "text/plain":
             logger.info("Processing text file...")
             text = str(uploaded_file.read(), "utf-8")
             logger.info(f"Successfully read {len(text)} characters from text file")
-            st.session_state.extraction_method = "Plain Text"
             
         else:
             error_msg = f"Unsupported file type: {file_type}"
@@ -278,35 +481,13 @@ def extract_text_from_file_simple(uploaded_file) -> Optional[str]:
             st.warning("⚠️ No text content found in the uploaded file")
             return None
         
-        logger.info(f"Simplified text extraction completed successfully. Total characters: {len(text)}")
+        logger.info(f"Text extraction completed successfully. Total characters: {len(text)}")
         return text
             
     except Exception as e:
         error_msg = f"Error extracting text from {file_name}: {str(e)}"
         logger.error(error_msg)
         st.error(f"❌ {error_msg}")
-        return None
-
-def process_scanned_pdf_with_vision(uploaded_file, page_count) -> Optional[str]:
-    """Process scanned PDF with AI Vision - simplified approach"""
-    try:
-        # Limit processing to reduce time and cost
-        max_pages_to_process = min(3, page_count)
-        st.warning(f"📄 **Processing first {max_pages_to_process} pages only** to reduce processing time")
-        
-        # We need to convert PDF pages to images somehow
-        # Since we're avoiding PyMuPDF, let's try a different approach
-        st.error("❌ **Scanned PDF processing temporarily unavailable**")
-        st.info("To process scanned documents, please:")
-        st.info("1. **Convert PDF to images** using an online tool")
-        st.info("2. **Upload individual page images** (.jpg or .png)")
-        st.info("3. **Or convert to a text-based PDF** using OCR software")
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error in scanned PDF processing: {str(e)}")
-        st.error(f"❌ Error processing scanned PDF: {str(e)}")
         return None
 
 def get_extraction_schema(document_type: str) -> str:
@@ -1663,14 +1844,14 @@ def main():
             
             # Show extraction method being used
             if uploaded_file.type == "application/pdf":
-                extraction_method = "📄 Simplified PDF Processing: PyPDF2 → AI Vision (if needed)"
+                extraction_method = "🚀 Threaded PDF Processing: PyMuPDF → Parallel OCR → Parallel Vision API"
             else:
                 extraction_method = "📄 Standard Processing for Non-PDF Files"
             
             st.info(f"🔄 **Extraction Method:** {extraction_method}")
             
-            # Process the document with simplified extraction
-            with st.spinner("📄 Processing document..."):
+            # Process the document with optimized extraction
+            with st.spinner("🚀 Processing document with optimized extraction..."):
                 # Create a progress placeholder
                 progress_placeholder = st.empty()
                 status_placeholder = st.empty()
@@ -1679,8 +1860,19 @@ def main():
                 status_placeholder.info("📄 **Step 1:** Extracting text from document...")
                 progress_placeholder.progress(0.3)
                 
-                # Use simplified processing method (no OCR dependencies)
-                document_text = extract_text_from_file_simple(uploaded_file)
+                # Use appropriate processing method
+                if uploaded_file.type == "application/pdf":
+                    # For PDFs, try threaded processing if PyMuPDF available
+                    try:
+                        import fitz
+                        status_placeholder.info("🚀 **Using threaded PDF processing...**")
+                        document_text = extract_text_from_file_threaded(uploaded_file)
+                    except ImportError:
+                        status_placeholder.info("📄 **Using standard PDF processing...**")
+                        document_text = extract_text_from_file(uploaded_file)
+                else:
+                    # For non-PDFs, use standard processing
+                    document_text = extract_text_from_file(uploaded_file)
                 
                 progress_placeholder.progress(0.6)
                 
@@ -1833,124 +2025,6 @@ def main():
             - **MSA:** Service details, payment terms, parties, termination clauses
             """)
     
-    # Show extraction methods available
-    with st.sidebar:
-        st.header("📊 System Status")
-        
-        # Check available extraction methods
-        st.subheader("🔧 Processing Methods")
-        
-        # PyPDF2 (main method)
-        st.success("✅ PyPDF2 available (Text-based PDFs)")
-        
-        # DOCX Support
-        st.success("✅ Word document support")
-        
-        # Image Support
-        st.success("✅ Image processing with AI Vision")
-        
-        # OpenAI Vision fallback
-        if api_configured:
-            st.success("✅ OpenAI Vision API (Images & Scanned PDFs)")
-        else:
-            st.error("❌ OpenAI API not configured")
-        
-        # Show simplified approach
-        st.subheader("📋 Supported Documents")
-        st.markdown("""
-        **📄 Document Types:**
-        - **🏠 Rental Agreements** - Lease contracts, property rentals
-        - **🔒 NDAs** - Non-disclosure agreements, confidentiality contracts  
-        - **📋 MSAs** - Master service agreements, service contracts
-        
-        **🚀 Streamlined Processing:**
-        1. 📄 Text-based PDFs: Fast extraction with PyPDF2
-        2. 📝 Word documents: Direct text processing
-        3. 🖼️ Images: AI Vision text extraction
-        4. 🎯 Simplified, reliable processing for Streamlit Cloud
-        """)
-        
-        # Performance info
-        st.subheader("⚡ Performance Features")
-        st.markdown("""
-        - **🔍 Instant answers** for document-specific questions
-        - **📄 Fast PDF processing** for text-based documents
-        - **🎯 Smart context selection** based on question type
-        - **📊 Streamlit Cloud optimized** for reliability
-        """)
-        
-        # Show question examples based on document type
-        current_doc_type = getattr(st.session_state, 'document_type', 'Rental')
-        st.subheader(f"💡 Try These {current_doc_type} Questions")
-        
-        if current_doc_type == "Rental":
-            st.markdown("""
-            **⚡ Quick Questions:**
-            - Who is the tenant/landlord?
-            - When does lease expire?
-            - How much is the rent?
-            - What's the property address?
-            
-            **📋 Detailed Questions:**
-            - What are tenant obligations?
-            - Can I sublet the property?
-            - What are the penalty clauses?
-            """)
-        elif current_doc_type == "NDA":
-            st.markdown("""
-            **⚡ Quick Questions:**
-            - Who is the disclosing/receiving party?
-            - When does the NDA expire?
-            - How long is confidentiality period?
-            
-            **📋 Detailed Questions:**
-            - What are the exceptions to confidentiality?
-            - What happens if confidentiality is breached?
-            - Can information be shared with employees?
-            """)
-        elif current_doc_type == "MSA":
-            st.markdown("""
-            **⚡ Quick Questions:**
-            - Who is the service provider/client?
-            - What services are covered?
-            - What are the payment terms?
-            
-            **📋 Detailed Questions:**
-            - What are the termination conditions?
-            - What are each party's key obligations?
-            - How are disputes resolved?
-            """)
-        
-        st.markdown("---")
-        st.markdown("**✨ Streamlit Cloud Optimized:**")
-        st.markdown("- 📊 **Simplified Processing**: No complex dependencies")
-        st.markdown("- 📝 **Fast Text PDFs**: Instant processing")
-        st.markdown("- 💬 **Smart Chat**: Primary interaction method")
-        st.markdown("- ⚡ **Reliable**: Optimized for cloud deployment")
-        st.markdown("- 🔍 **Image Support**: AI Vision for scanned docs")
-        
-        if os.path.exists('rental_analyzer.log'):
-            st.success("✅ Logging active")
-            if st.button("View Recent Logs"):
-                try:
-                    with open('rental_analyzer.log', 'r') as f:
-                        logs = f.readlines()
-                        recent_logs = logs[-30:] if len(logs) > 30 else logs
-                        st.text_area("Recent Logs", "".join(recent_logs), height=400)
-                except Exception as e:
-                    st.error(f"Error reading logs: {str(e)}")
-        else:
-            st.warning("⚠️ Log file not found")
-        
-        st.markdown("---")
-        st.markdown("**📋 File Format Tips:**")
-        st.markdown("- **Best:** Text-based PDFs (fast processing)")
-        st.markdown("- **Good:** Word documents (.docx)")
-        st.markdown("- **Supported:** Images (.jpg, .png) via AI Vision")
-        st.markdown("- **Note:** Scanned PDFs require AI Vision (slower)")
-        st.markdown("**Requirements:**")
-        st.markdown("- `.env` file with `OPENAI_API_KEY`")
-        st.markdown("- Stable internet connection for AI features")
-
+    
 if __name__ == "__main__":
     main()
