@@ -198,82 +198,84 @@ def process_pdf_page_vision(page_data: tuple) -> str:
         return ""
 
 def extract_text_from_file_threaded(uploaded_file) -> Optional[str]:
-    """Extract text from various file formats with 2-layer approach: PyMuPDF → OpenAI Vision"""
+    """Extract text from various file formats with Vision API and proper threading"""
     file_type = uploaded_file.type
     file_name = uploaded_file.name
     file_size = uploaded_file.size
     
-    logger.info(f"Starting 2-layer text extraction from file: {file_name}")
+    logger.info(f"Starting Vision API text extraction from file: {file_name}")
     logger.info(f"File type: {file_type}, Size: {file_size} bytes")
     
     text = ""
     
     try:
         if file_type == "application/pdf":
-            logger.info("Processing PDF file with 2-layer approach (PyMuPDF → Vision)...")
+            logger.info("Processing PDF file directly with OpenAI Vision API + Threading...")
             
-            # Try PyMuPDF for better PDF handling
+            # Use PyMuPDF only for PDF to image conversion
             try:
                 import fitz  # PyMuPDF
-                logger.info("Using PyMuPDF with 2-layer approach for PDF processing")
+                logger.info("Using PyMuPDF for PDF to image conversion only")
                 
                 # Read the uploaded file
                 pdf_data = uploaded_file.read()
                 pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
                 page_count = len(pdf_document)
-                logger.info(f"PDF has {page_count} pages - preparing for 2-layer processing")
+                logger.info(f"PDF has {page_count} pages - preparing for threaded Vision API processing")
                 
-                # Layer 1: Try text extraction first
-                text_pages = []
+                # Convert all pages to images for Vision API
+                page_data_list = []
                 for page_num in range(page_count):
                     page = pdf_document.load_page(page_num)
-                    page_text = page.get_text()
-                    text_pages.append(page_text)
-                
-                text = "\n".join(text_pages)
-                logger.info(f"PyMuPDF text extraction: {len(text)} characters")
-                extraction_method_used = "PyMuPDF Text Extraction"
-                
-                # Layer 2: If minimal text, use threaded OpenAI Vision directly
-                if len(text.strip()) < 150:  # Adjusted threshold
-                    logger.warning("Minimal text from PyMuPDF, using threaded OpenAI Vision API directly")
-                    text = ""
-                    extraction_method_used = "Threaded OpenAI Vision API"
-                    
-                    # Prepare page data for Vision API threading
-                    page_data_list = []
-                    for page_num in range(page_count):
-                        page = pdf_document.load_page(page_num)
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-                        img_data = pix.tobytes("png")
-                        page_data_list.append((page_num, img_data))
-                    
-                    # Process pages in parallel (limited workers for API rate limits)
-                    logger.info(f"Starting threaded OpenAI Vision for {page_count} pages")
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, page_count)) as executor:
-                        page_texts = list(executor.map(process_pdf_page_vision, page_data_list))
-                    
-                    text = "\n".join(filter(None, page_texts))  # Filter out None/empty results
-                    logger.info(f"Threaded Vision API completed: {len(text)} characters")
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # High resolution
+                    img_data = pix.tobytes("png")
+                    page_data_list.append((page_num, img_data))
                 
                 pdf_document.close()
-                logger.info(f"2-layer PDF extraction completed: {len(text)} characters using {extraction_method_used}")
+                
+                # Process all pages with Vision API using proper threading
+                logger.info(f"Starting threaded OpenAI Vision for all {page_count} pages")
+                max_workers = min(3, page_count)  # Limit concurrent API calls
+                logger.info(f"Using {max_workers} concurrent threads for Vision API")
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    # Submit all tasks
+                    future_to_page = {executor.submit(process_pdf_page_vision, page_data): page_data[0] 
+                                    for page_data in page_data_list}
+                    
+                    # Collect results in order
+                    page_texts = [""] * page_count
+                    completed = 0
+                    
+                    for future in concurrent.futures.as_completed(future_to_page):
+                        page_num = future_to_page[future]
+                        try:
+                            page_text = future.result()
+                            page_texts[page_num] = page_text or ""
+                            completed += 1
+                            logger.info(f"Completed page {page_num + 1}/{page_count} ({completed}/{page_count} total)")
+                        except Exception as exc:
+                            logger.error(f"Page {page_num + 1} generated an exception: {exc}")
+                            page_texts[page_num] = ""
+                
+                text = "\n".join(filter(None, page_texts))  # Join non-empty results
+                logger.info(f"Threaded Vision API completed: {len(text)} characters from {page_count} pages")
                 
                 # Store the extraction method for display
-                if 'extraction_method' not in st.session_state:
-                    st.session_state.extraction_method = extraction_method_used
+                st.session_state.extraction_method = "Threaded OpenAI Vision API"
                 
             except ImportError:
-                logger.warning("PyMuPDF not available, falling back to PyPDF2 (no threading)")
-                return extract_text_from_file(uploaded_file)  # Fallback to original method
+                logger.error("PyMuPDF not available - required for PDF processing")
+                st.error("❌ PyMuPDF not available. Install with: pip install PyMuPDF")
+                return None
             
             except Exception as e:
-                logger.error(f"Error in 2-layer PDF processing: {str(e)}")
+                logger.error(f"Error in Vision API PDF processing: {str(e)}")
                 st.error(f"❌ Error processing PDF: {str(e)}")
                 return None
                 
         else:
-            # For non-PDF files, use the original method (no threading needed)
+            # For non-PDF files, use the original method
             logger.info("Non-PDF file detected, using standard extraction")
             uploaded_file.seek(0)  # Reset file pointer
             return extract_text_from_file(uploaded_file)
@@ -283,34 +285,34 @@ def extract_text_from_file_threaded(uploaded_file) -> Optional[str]:
             st.warning("⚠️ No text content found in the uploaded file")
             return None
         
-        logger.info(f"2-layer text extraction completed successfully. Total characters: {len(text)}")
+        logger.info(f"Vision API text extraction completed successfully. Total characters: {len(text)}")
         return text
             
     except Exception as e:
-        error_msg = f"Error in 2-layer extraction from {file_name}: {str(e)}"
+        error_msg = f"Error in Vision API extraction from {file_name}: {str(e)}"
         logger.error(error_msg)
         st.error(f"❌ {error_msg}")
         return None
 
 def extract_text_from_file(uploaded_file) -> Optional[str]:
-    """Extract text from various file formats with 2-layer approach: PyMuPDF → OpenAI Vision"""
+    """Extract text from various file formats using Vision API for PDFs"""
     file_type = uploaded_file.type
     file_name = uploaded_file.name
     file_size = uploaded_file.size
     
-    logger.info(f"Starting 2-layer text extraction from file: {file_name}")
+    logger.info(f"Starting Vision API text extraction from file: {file_name}")
     logger.info(f"File type: {file_type}, Size: {file_size} bytes")
     
     text = ""
     
     try:
         if file_type == "application/pdf":
-            logger.info("Processing PDF file with 2-layer approach...")
+            logger.info("Processing PDF file directly with OpenAI Vision API...")
             
-            # Try PyMuPDF for better PDF handling
+            # Use PyMuPDF only for PDF to image conversion
             try:
                 import fitz  # PyMuPDF
-                logger.info("Using PyMuPDF for PDF processing")
+                logger.info("Using PyMuPDF for PDF to image conversion only")
                 
                 # Read the uploaded file
                 pdf_data = uploaded_file.read()
@@ -318,79 +320,44 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
                 page_count = len(pdf_document)
                 logger.info(f"PDF has {page_count} pages")
                 
-                # Layer 1: Try text extraction first
+                # Show progress for OpenAI Vision
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
                 for page_num in range(page_count):
+                    status_text.text(f"🤖 Processing page {page_num + 1}/{page_count} with OpenAI Vision...")
+                    progress_bar.progress((page_num + 1) / page_count)
+                    
                     page = pdf_document.load_page(page_num)
-                    page_text = page.get_text()
-                    text += page_text + "\n"
-                    logger.debug(f"Extracted {len(page_text)} characters from page {page_num + 1}")
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # High resolution
+                    img_data = pix.tobytes("png")
+                    
+                    # Convert to base64 for OpenAI
+                    img_base64 = base64.b64encode(img_data).decode('utf-8')
+                    
+                    logger.info(f"Using OpenAI Vision API for page {page_num + 1}")
+                    page_text = extract_text_with_openai_vision(img_base64, page_num + 1)
+                    if page_text:
+                        text += page_text + "\n"
+                        logger.info(f"OpenAI Vision extracted {len(page_text)} characters from page {page_num + 1}")
                 
-                logger.info(f"PyMuPDF text extraction: {len(text)} characters")
-                extraction_method_used = "PyMuPDF Text Extraction"
-                
-                # Layer 2: If minimal text, use OpenAI Vision directly
-                if len(text.strip()) < 150:  # Adjusted threshold
-                    logger.warning("Minimal text from PyMuPDF, using OpenAI Vision API directly")
-                    text = ""  # Reset
-                    extraction_method_used = "OpenAI Vision API"
-                    
-                    # Show progress for OpenAI Vision
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    for page_num in range(page_count):
-                        status_text.text(f"🤖 Processing page {page_num + 1}/{page_count} with OpenAI Vision...")
-                        progress_bar.progress((page_num + 1) / page_count)
-                        
-                        page = pdf_document.load_page(page_num)
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-                        img_data = pix.tobytes("png")
-                        
-                        # Convert to base64 for OpenAI
-                        img_base64 = base64.b64encode(img_data).decode('utf-8')
-                        
-                        logger.info(f"Using OpenAI Vision API for page {page_num + 1}")
-                        page_text = extract_text_with_openai_vision(img_base64, page_num + 1)
-                        if page_text:
-                            text += page_text + "\n"
-                            logger.info(f"OpenAI Vision extracted {len(page_text)} characters from page {page_num + 1}")
-                    
-                    # Clear progress indicators
-                    progress_bar.empty()
-                    status_text.empty()
+                # Clear progress indicators
+                progress_bar.empty()
+                status_text.empty()
                 
                 pdf_document.close()
-                logger.info(f"Final 2-layer extraction completed: {len(text)} characters using {extraction_method_used}")
+                logger.info(f"Vision API PDF extraction completed: {len(text)} characters")
                 
                 # Store the extraction method for display
-                if 'extraction_method' not in st.session_state:
-                    st.session_state.extraction_method = extraction_method_used
+                st.session_state.extraction_method = "OpenAI Vision API"
                 
             except ImportError:
-                logger.warning("PyMuPDF not available, falling back to PyPDF2")
-                
-                # Fallback to PyPDF2 method (basic)
-                uploaded_file.seek(0)  # Reset file pointer
-                pdf_reader = PyPDF2.PdfReader(uploaded_file)
-                page_count = len(pdf_reader.pages)
-                logger.info(f"PDF has {page_count} pages (PyPDF2 fallback)")
-                
-                for i, page in enumerate(pdf_reader.pages):
-                    page_text = page.extract_text()
-                    text += page_text + "\n"
-                    logger.debug(f"Extracted {len(page_text)} characters from page {i+1}")
-                
-                logger.info(f"PyPDF2 extraction completed: {len(text)} characters")
-                st.session_state.extraction_method = "PyPDF2 (Basic)"
-                
-                # If minimal text with PyPDF2, suggest installing PyMuPDF
-                if len(text.strip()) < 150:
-                    logger.error("Minimal text extraction with PyPDF2. Install PyMuPDF for better support")
-                    st.error("❌ This appears to be a scanned PDF. For better extraction, install PyMuPDF:")
-                    st.code("pip install PyMuPDF")
+                logger.error("PyMuPDF not available - required for PDF processing")
+                st.error("❌ PyMuPDF not available. Install with: pip install PyMuPDF")
+                return None
             
             except Exception as e:
-                logger.error(f"Error in PDF processing: {str(e)}")
+                logger.error(f"Error in Vision API PDF processing: {str(e)}")
                 st.error(f"❌ Error processing PDF: {str(e)}")
                 return None
                 
@@ -407,12 +374,23 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
             logger.info(f"Successfully extracted {len(text)} characters from DOCX")
                 
         elif file_type in ["image/jpeg", "image/jpg", "image/png", "image/tiff"]:
-            logger.info(f"Processing image file with OCR: {file_type}")
-            image = Image.open(uploaded_file)
-            logger.info(f"Image dimensions: {image.size}")
+            logger.info(f"Processing image file with Vision API: {file_type}")
             
-            text = pytesseract.image_to_string(image)
-            logger.info(f"OCR extraction completed: {len(text)} characters extracted")
+            # Convert image to base64 for Vision API
+            image_data = uploaded_file.read()
+            img_base64 = base64.b64encode(image_data).decode('utf-8')
+            
+            logger.info("Using OpenAI Vision API for image")
+            text = extract_text_with_openai_vision(img_base64, 1)
+            if text:
+                logger.info(f"Vision API extracted {len(text)} characters from image")
+            else:
+                logger.warning("Vision API failed, falling back to OCR")
+                # Fallback to OCR for images only
+                uploaded_file.seek(0)
+                image = Image.open(uploaded_file)
+                text = pytesseract.image_to_string(image)
+                logger.info(f"OCR fallback extracted {len(text)} characters")
             
         elif file_type == "text/plain":
             logger.info("Processing text file...")
@@ -430,7 +408,7 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
             st.warning("⚠️ No text content found in the uploaded file")
             return None
         
-        logger.info(f"2-layer text extraction completed successfully. Total characters: {len(text)}")
+        logger.info(f"Vision API text extraction completed successfully. Total characters: {len(text)}")
         return text
             
     except Exception as e:
@@ -1952,7 +1930,6 @@ def main():
         logger.info("No file uploaded yet")
         st.info("👆 Please select document type and upload a contract to get started")
         
-    
     
 if __name__ == "__main__":
     main()
