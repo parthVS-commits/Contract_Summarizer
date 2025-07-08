@@ -1769,13 +1769,13 @@ def main():
             
             logger.info("Processing new file or file not in session state")
             
-            # Show extraction method being used
-            if uploaded_file.type == "application/pdf":
-                extraction_method = "🚀 2-Layer Processing: PyMuPDF → OpenAI Vision API (No OCR)"
-            else:
-                extraction_method = "📄 Standard Processing for Non-PDF Files"
+            # # Show extraction method being used
+            # if uploaded_file.type == "application/pdf":
+            #     extraction_method = "🚀 2-Layer Processing: PyMuPDF → OpenAI Vision API (No OCR)"
+            # else:
+            #     extraction_method = "📄 Standard Processing for Non-PDF Files"
             
-            st.info(f"🔄 **Extraction Method:** {extraction_method}")
+            # st.info(f"🔄 **Extraction Method:** {extraction_method}")
             
             # Process the document with optimized extraction
             with st.spinner("🚀 Processing document with 2-layer extraction..."):
