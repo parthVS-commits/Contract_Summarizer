@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import PyPDF2
 import docx
 from PIL import Image
-import pytesseract  # Keep for image files only
+import pytesseract
 import io
 import json
 import re
@@ -185,6 +185,18 @@ def extract_text_with_openai_vision(img_base64: str, page_num: int) -> Optional[
         st.warning(f"⚠️ OpenAI Vision failed for page {page_num}: {str(e)}")
         return None
 
+def process_pdf_page_ocr(page_data: tuple) -> str:
+    """Process a single PDF page with OCR (for threading)"""
+    page_num, img_data = page_data
+    try:
+        image = Image.open(io.BytesIO(img_data))
+        page_text = pytesseract.image_to_string(image, config='--psm 6')
+        logger.info(f"OCR thread: Page {page_num + 1} extracted {len(page_text)} characters")
+        return page_text
+    except Exception as e:
+        logger.error(f"OCR thread: Error processing page {page_num + 1}: {str(e)}")
+        return ""
+
 def process_pdf_page_vision(page_data: tuple) -> str:
     """Process a single PDF page with OpenAI Vision (for threading)"""
     page_num, img_data = page_data
@@ -198,84 +210,104 @@ def process_pdf_page_vision(page_data: tuple) -> str:
         return ""
 
 def extract_text_from_file_threaded(uploaded_file) -> Optional[str]:
-    """Extract text from various file formats with Vision API and proper threading"""
+    """Extract text from various file formats with threading support"""
     file_type = uploaded_file.type
     file_name = uploaded_file.name
     file_size = uploaded_file.size
     
-    logger.info(f"Starting Vision API text extraction from file: {file_name}")
+    logger.info(f"Starting threaded text extraction from file: {file_name}")
     logger.info(f"File type: {file_type}, Size: {file_size} bytes")
     
     text = ""
     
     try:
         if file_type == "application/pdf":
-            logger.info("Processing PDF file directly with OpenAI Vision API + Threading...")
+            logger.info("Processing PDF file with threading...")
             
-            # Use PyMuPDF only for PDF to image conversion
+            # First try PyMuPDF for better PDF handling
             try:
                 import fitz  # PyMuPDF
-                logger.info("Using PyMuPDF for PDF to image conversion only")
+                logger.info("Using PyMuPDF with threading for PDF processing")
                 
                 # Read the uploaded file
                 pdf_data = uploaded_file.read()
                 pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
                 page_count = len(pdf_document)
-                logger.info(f"PDF has {page_count} pages - preparing for threaded Vision API processing")
+                logger.info(f"PDF has {page_count} pages - preparing for threaded processing")
                 
-                # Convert all pages to images for Vision API
-                page_data_list = []
+                # Try text extraction first
+                text_pages = []
                 for page_num in range(page_count):
                     page = pdf_document.load_page(page_num)
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # High resolution
-                    img_data = pix.tobytes("png")
-                    page_data_list.append((page_num, img_data))
+                    page_text = page.get_text()
+                    text_pages.append(page_text)
+                
+                text = "\n".join(text_pages)
+                logger.info(f"PyMuPDF text extraction: {len(text)} characters")
+                extraction_method_used = "PyMuPDF Text Extraction"
+                
+                # If minimal text, use threaded OCR
+                if len(text.strip()) < 100:
+                    logger.warning("Minimal text from PyMuPDF, using threaded OCR processing")
+                    text = ""
+                    extraction_method_used = "PyMuPDF + Threaded OCR"
+                    
+                    # Prepare page data for threading
+                    page_data_list = []
+                    for page_num in range(page_count):
+                        page = pdf_document.load_page(page_num)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                        img_data = pix.tobytes("png")
+                        page_data_list.append((page_num, img_data))
+                    
+                    # Process pages in parallel using ThreadPoolExecutor
+                    logger.info(f"Starting threaded OCR for {page_count} pages")
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, page_count)) as executor:
+                        page_texts = list(executor.map(process_pdf_page_ocr, page_data_list))
+                    
+                    text = "\n".join(page_texts)
+                    logger.info(f"Threaded OCR completed: {len(text)} characters")
+                
+                # If still minimal text, use threaded OpenAI Vision
+                if len(text.strip()) < 200:
+                    logger.warning("OCR results poor, using threaded OpenAI Vision API")
+                    text = ""
+                    extraction_method_used = "Threaded OpenAI Vision API"
+                    
+                    # Prepare page data for Vision API threading
+                    page_data_list = []
+                    for page_num in range(page_count):
+                        page = pdf_document.load_page(page_num)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                        img_data = pix.tobytes("png")
+                        page_data_list.append((page_num, img_data))
+                    
+                    # Process pages in parallel (limited workers for API rate limits)
+                    logger.info(f"Starting threaded OpenAI Vision for {page_count} pages")
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, page_count)) as executor:
+                        page_texts = list(executor.map(process_pdf_page_vision, page_data_list))
+                    
+                    text = "\n".join(filter(None, page_texts))  # Filter out None/empty results
+                    logger.info(f"Threaded Vision API completed: {len(text)} characters")
                 
                 pdf_document.close()
-                
-                # Process all pages with Vision API using proper threading
-                logger.info(f"Starting threaded OpenAI Vision for all {page_count} pages")
-                max_workers = min(3, page_count)  # Limit concurrent API calls
-                logger.info(f"Using {max_workers} concurrent threads for Vision API")
-                
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    # Submit all tasks
-                    future_to_page = {executor.submit(process_pdf_page_vision, page_data): page_data[0] 
-                                    for page_data in page_data_list}
-                    
-                    # Collect results in order
-                    page_texts = [""] * page_count
-                    completed = 0
-                    
-                    for future in concurrent.futures.as_completed(future_to_page):
-                        page_num = future_to_page[future]
-                        try:
-                            page_text = future.result()
-                            page_texts[page_num] = page_text or ""
-                            completed += 1
-                            logger.info(f"Completed page {page_num + 1}/{page_count} ({completed}/{page_count} total)")
-                        except Exception as exc:
-                            logger.error(f"Page {page_num + 1} generated an exception: {exc}")
-                            page_texts[page_num] = ""
-                
-                text = "\n".join(filter(None, page_texts))  # Join non-empty results
-                logger.info(f"Threaded Vision API completed: {len(text)} characters from {page_count} pages")
+                logger.info(f"Threaded PDF extraction completed: {len(text)} characters using {extraction_method_used}")
                 
                 # Store the extraction method for display
-                st.session_state.extraction_method = "Threaded OpenAI Vision API"
+                if 'extraction_method' not in st.session_state:
+                    st.session_state.extraction_method = extraction_method_used
                 
             except ImportError:
-                logger.error("PyMuPDF not available - required for PDF processing")
-                st.error("❌ PyMuPDF not available. Install with: pip install PyMuPDF")
-                return None
+                logger.warning("PyMuPDF not available, falling back to PyPDF2 (no threading)")
+                return extract_text_from_file(uploaded_file)  # Fallback to original method
             
             except Exception as e:
-                logger.error(f"Error in Vision API PDF processing: {str(e)}")
+                logger.error(f"Error in threaded PDF processing: {str(e)}")
                 st.error(f"❌ Error processing PDF: {str(e)}")
                 return None
                 
         else:
-            # For non-PDF files, use the original method
+            # For non-PDF files, use the original method (no threading needed)
             logger.info("Non-PDF file detected, using standard extraction")
             uploaded_file.seek(0)  # Reset file pointer
             return extract_text_from_file(uploaded_file)
@@ -285,34 +317,34 @@ def extract_text_from_file_threaded(uploaded_file) -> Optional[str]:
             st.warning("⚠️ No text content found in the uploaded file")
             return None
         
-        logger.info(f"Vision API text extraction completed successfully. Total characters: {len(text)}")
+        logger.info(f"Threaded text extraction completed successfully. Total characters: {len(text)}")
         return text
             
     except Exception as e:
-        error_msg = f"Error in Vision API extraction from {file_name}: {str(e)}"
+        error_msg = f"Error in threaded extraction from {file_name}: {str(e)}"
         logger.error(error_msg)
         st.error(f"❌ {error_msg}")
         return None
 
 def extract_text_from_file(uploaded_file) -> Optional[str]:
-    """Extract text from various file formats using Vision API for PDFs"""
+    """Extract text from various file formats with comprehensive logging"""
     file_type = uploaded_file.type
     file_name = uploaded_file.name
     file_size = uploaded_file.size
     
-    logger.info(f"Starting Vision API text extraction from file: {file_name}")
+    logger.info(f"Starting text extraction from file: {file_name}")
     logger.info(f"File type: {file_type}, Size: {file_size} bytes")
     
     text = ""
     
     try:
         if file_type == "application/pdf":
-            logger.info("Processing PDF file directly with OpenAI Vision API...")
+            logger.info("Processing PDF file...")
             
-            # Use PyMuPDF only for PDF to image conversion
+            # First try PyMuPDF for better PDF handling
             try:
                 import fitz  # PyMuPDF
-                logger.info("Using PyMuPDF for PDF to image conversion only")
+                logger.info("Using PyMuPDF for PDF processing")
                 
                 # Read the uploaded file
                 pdf_data = uploaded_file.read()
@@ -320,44 +352,96 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
                 page_count = len(pdf_document)
                 logger.info(f"PDF has {page_count} pages")
                 
-                # Show progress for OpenAI Vision
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
+                # Try text extraction first
                 for page_num in range(page_count):
-                    status_text.text(f"🤖 Processing page {page_num + 1}/{page_count} with OpenAI Vision...")
-                    progress_bar.progress((page_num + 1) / page_count)
-                    
                     page = pdf_document.load_page(page_num)
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # High resolution
-                    img_data = pix.tobytes("png")
-                    
-                    # Convert to base64 for OpenAI
-                    img_base64 = base64.b64encode(img_data).decode('utf-8')
-                    
-                    logger.info(f"Using OpenAI Vision API for page {page_num + 1}")
-                    page_text = extract_text_with_openai_vision(img_base64, page_num + 1)
-                    if page_text:
-                        text += page_text + "\n"
-                        logger.info(f"OpenAI Vision extracted {len(page_text)} characters from page {page_num + 1}")
+                    page_text = page.get_text()
+                    text += page_text + "\n"
+                    logger.debug(f"Extracted {len(page_text)} characters from page {page_num + 1}")
                 
-                # Clear progress indicators
-                progress_bar.empty()
-                status_text.empty()
+                logger.info(f"PyMuPDF text extraction: {len(text)} characters")
+                extraction_method_used = "PyMuPDF Text Extraction"
+                
+                # If minimal text, try OCR
+                if len(text.strip()) < 100:
+                    logger.warning("Minimal text from PyMuPDF, using OCR on PDF pages")
+                    text = ""  # Reset
+                    extraction_method_used = "PyMuPDF + OCR"
+                    
+                    for page_num in range(page_count):
+                        page = pdf_document.load_page(page_num)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # Higher resolution
+                        img_data = pix.tobytes("png")
+                        image = Image.open(io.BytesIO(img_data))
+                        
+                        logger.info(f"Running OCR on page {page_num + 1}")
+                        page_text = pytesseract.image_to_string(image, config='--psm 6')
+                        text += page_text + "\n"
+                        logger.info(f"OCR extracted {len(page_text)} characters from page {page_num + 1}")
+                
+                # If still minimal text, fallback to OpenAI Vision
+                if len(text.strip()) < 200:
+                    logger.warning("OCR results poor, falling back to OpenAI Vision API")
+                    text = ""  # Reset
+                    extraction_method_used = "OpenAI Vision API"
+                    
+                    # Show progress for OpenAI Vision
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    for page_num in range(page_count):
+                        status_text.text(f"🤖 Processing page {page_num + 1}/{page_count} with OpenAI Vision...")
+                        progress_bar.progress((page_num + 1) / page_count)
+                        
+                        page = pdf_document.load_page(page_num)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                        img_data = pix.tobytes("png")
+                        
+                        # Convert to base64 for OpenAI
+                        img_base64 = base64.b64encode(img_data).decode('utf-8')
+                        
+                        logger.info(f"Using OpenAI Vision API for page {page_num + 1}")
+                        page_text = extract_text_with_openai_vision(img_base64, page_num + 1)
+                        if page_text:
+                            text += page_text + "\n"
+                            logger.info(f"OpenAI Vision extracted {len(page_text)} characters from page {page_num + 1}")
+                    
+                    # Clear progress indicators
+                    progress_bar.empty()
+                    status_text.empty()
                 
                 pdf_document.close()
-                logger.info(f"Vision API PDF extraction completed: {len(text)} characters")
+                logger.info(f"Final PyMuPDF extraction completed: {len(text)} characters using {extraction_method_used}")
                 
                 # Store the extraction method for display
-                st.session_state.extraction_method = "OpenAI Vision API"
+                if 'extraction_method' not in st.session_state:
+                    st.session_state.extraction_method = extraction_method_used
                 
             except ImportError:
-                logger.error("PyMuPDF not available - required for PDF processing")
-                st.error("❌ PyMuPDF not available. Install with: pip install PyMuPDF")
-                return None
+                logger.warning("PyMuPDF not available, falling back to PyPDF2 + OCR")
+                
+                # Fallback to original PyPDF2 method
+                uploaded_file.seek(0)  # Reset file pointer
+                pdf_reader = PyPDF2.PdfReader(uploaded_file)
+                page_count = len(pdf_reader.pages)
+                logger.info(f"PDF has {page_count} pages (PyPDF2 fallback)")
+                
+                for i, page in enumerate(pdf_reader.pages):
+                    page_text = page.extract_text()
+                    text += page_text + "\n"
+                    logger.debug(f"Extracted {len(page_text)} characters from page {i+1}")
+                
+                logger.info(f"PyPDF2 extraction completed: {len(text)} characters")
+                st.session_state.extraction_method = "PyPDF2 (Basic)"
+                
+                # If minimal text with PyPDF2, suggest installing PyMuPDF
+                if len(text.strip()) < 100:
+                    logger.error("Minimal text extraction with PyPDF2. Install PyMuPDF for better scanned PDF support")
+                    st.error("❌ This appears to be a scanned PDF. For better extraction, install PyMuPDF:")
+                    st.code("pip install PyMuPDF")
             
             except Exception as e:
-                logger.error(f"Error in Vision API PDF processing: {str(e)}")
+                logger.error(f"Error in PDF processing: {str(e)}")
                 st.error(f"❌ Error processing PDF: {str(e)}")
                 return None
                 
@@ -374,23 +458,12 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
             logger.info(f"Successfully extracted {len(text)} characters from DOCX")
                 
         elif file_type in ["image/jpeg", "image/jpg", "image/png", "image/tiff"]:
-            logger.info(f"Processing image file with Vision API: {file_type}")
+            logger.info(f"Processing image file with OCR: {file_type}")
+            image = Image.open(uploaded_file)
+            logger.info(f"Image dimensions: {image.size}")
             
-            # Convert image to base64 for Vision API
-            image_data = uploaded_file.read()
-            img_base64 = base64.b64encode(image_data).decode('utf-8')
-            
-            logger.info("Using OpenAI Vision API for image")
-            text = extract_text_with_openai_vision(img_base64, 1)
-            if text:
-                logger.info(f"Vision API extracted {len(text)} characters from image")
-            else:
-                logger.warning("Vision API failed, falling back to OCR")
-                # Fallback to OCR for images only
-                uploaded_file.seek(0)
-                image = Image.open(uploaded_file)
-                text = pytesseract.image_to_string(image)
-                logger.info(f"OCR fallback extracted {len(text)} characters")
+            text = pytesseract.image_to_string(image)
+            logger.info(f"OCR extraction completed: {len(text)} characters extracted")
             
         elif file_type == "text/plain":
             logger.info("Processing text file...")
@@ -408,7 +481,7 @@ def extract_text_from_file(uploaded_file) -> Optional[str]:
             st.warning("⚠️ No text content found in the uploaded file")
             return None
         
-        logger.info(f"Vision API text extraction completed successfully. Total characters: {len(text)}")
+        logger.info(f"Text extraction completed successfully. Total characters: {len(text)}")
         return text
             
     except Exception as e:
@@ -511,6 +584,70 @@ def get_extraction_schema(document_type: str) -> str:
             "liability_indemnity": ["Limitation of liability and indemnification terms"]
         }"""
     
+    elif document_type == "Insurance":
+        return """
+        {
+            "document_type": "Insurance Policy",
+            "contract_summary": "Brief 2-3 sentence summary of the insurance policy",
+            "parties": {
+                "insurer": "Insurance company name and details",
+                "policyholder": "Insured person/entity name and details",
+                "beneficiary": "Beneficiary details if applicable"
+            },
+            "policy_details": {
+                "policy_number": "Policy identification number",
+                "insurance_type": "Type of insurance (Health/Auto/Life/Property/etc.)",
+                "coverage_amount": "Coverage limits and amounts",
+                "deductible": "Deductible amount"
+            },
+            "financial_terms": {
+                "premium_amount": "Premium cost and payment frequency",
+                "copayment": "Copayment amounts if applicable",
+                "coinsurance": "Coinsurance percentages if applicable",
+                "out_of_pocket_maximum": "Maximum out-of-pocket costs"
+            },
+            "dates": {
+                "policy_start": "YYYY-MM-DD format",
+                "policy_end": "YYYY-MM-DD format",
+                "renewal_date": "YYYY-MM-DD format",
+                "grace_period": "Grace period for payments"
+            },
+            "coverage_details": ["List of what is covered by the policy"],
+            "exclusions": ["List of what is excluded from coverage"],
+            "claim_procedures": ["How to file claims and claim process"]
+        }"""
+    
+    elif document_type == "MOU":
+        return """
+        {
+            "document_type": "Memorandum of Understanding",
+            "contract_summary": "Brief 2-3 sentence summary of the MOU",
+            "parties": {
+                "party_1": "First organization/entity name and details",
+                "party_2": "Second organization/entity name and details",
+                "additional_parties": "Other parties if multi-party MOU"
+            },
+            "purpose": {
+                "objective": "Main objective and purpose of the MOU",
+                "background": "Background context for the agreement",
+                "scope": "Scope and areas covered by the MOU"
+            },
+            "responsibilities": {
+                "party_1_obligations": "First party's duties and responsibilities",
+                "party_2_obligations": "Second party's duties and responsibilities",
+                "shared_responsibilities": "Joint or shared obligations"
+            },
+            "dates": {
+                "execution_date": "YYYY-MM-DD format",
+                "effective_date": "YYYY-MM-DD format",
+                "duration": "Duration or term of the MOU",
+                "review_date": "YYYY-MM-DD format for periodic review"
+            },
+            "key_terms": ["List of important terms and conditions"],
+            "termination_conditions": ["Conditions under which MOU can be terminated"],
+            "governance": ["How the MOU will be managed and monitored"]
+        }"""
+    
     else:
         return get_extraction_schema("Rental")  # Default to rental
 
@@ -562,6 +699,46 @@ def extract_contract_info(document_text: str, document_type: str = "Rental") -> 
             Make sure document_type is set to "Master Service Agreement"."""
             
             user_prompt = f"Extract information from this Master Service Agreement:\n\n{document_text}"
+            
+        elif document_type == "Insurance":
+            system_prompt = f"""You are an expert insurance policy analyzer specializing in all types of insurance policies.
+            
+            Extract comprehensive information from this insurance policy document and return a JSON object with the following structure:
+            {schema}
+            
+            Pay special attention to:
+            - Insurance company and policyholder details
+            - Policy type (Health, Auto, Life, Property, etc.) and coverage amounts
+            - Premium costs, deductibles, copayments, and coinsurance
+            - Policy effective dates and renewal information
+            - What is covered and what is excluded
+            - Claim procedures and requirements
+            
+            If any information is not found, use "Not specified" as the value.
+            Ensure dates are in YYYY-MM-DD format for calculation purposes.
+            Make sure document_type is set to "Insurance Policy"."""
+            
+            user_prompt = f"Extract information from this Insurance Policy:\n\n{document_text}"
+            
+        elif document_type == "MOU":
+            system_prompt = f"""You are an expert contract analyzer specializing in Memorandums of Understanding (MOUs).
+            
+            Extract comprehensive information from this MOU document and return a JSON object with the following structure:
+            {schema}
+            
+            Pay special attention to:
+            - All parties involved (bilateral or multilateral)
+            - Purpose, objectives, and scope of the MOU
+            - Specific responsibilities and obligations of each party
+            - Duration and review periods
+            - Governance and management structure
+            - Termination conditions
+            
+            If any information is not found, use "Not specified" as the value.
+            Ensure dates are in YYYY-MM-DD format for calculation purposes.
+            Make sure document_type is set to "Memorandum of Understanding"."""
+            
+            user_prompt = f"Extract information from this Memorandum of Understanding:\n\n{document_text}"
             
         else:  # Default to Rental
             system_prompt = f"""You are an expert legal contract analyzer specializing in rental/lease agreements.
@@ -714,6 +891,14 @@ def validate_and_enhance_document_type(parsed_data: Dict[str, Any], document_tex
         if any(keyword in doc_type_lower for keyword in ["msa", "master service", "service agreement", "master agreement"]):
             return "Master Service Agreement"
         
+        # Insurance variations
+        if any(keyword in doc_type_lower for keyword in ["insurance", "policy", "coverage", "premium"]):
+            return "Insurance Policy"
+        
+        # MOU variations
+        if any(keyword in doc_type_lower for keyword in ["mou", "memorandum", "understanding", "memo"]):
+            return "Memorandum of Understanding"
+        
         # Rental variations
         if any(keyword in doc_type_lower for keyword in ["rental", "lease", "tenancy", "rent agreement"]):
             return "Rental Agreement"
@@ -766,6 +951,38 @@ def validate_and_enhance_document_type(parsed_data: Dict[str, Any], document_tex
                 "effect_of_termination": "Immediate cessation of services"
             }
     
+    elif normalized_type == "Insurance Policy":
+        if "policy_details" not in parsed_data and "parties" in parsed_data:
+            logger.warning("Insurance detected but missing policy_details, adding defaults")
+            parsed_data["policy_details"] = {
+                "policy_number": "Not specified",
+                "insurance_type": "General insurance policy",
+                "coverage_amount": "As specified in the policy",
+                "deductible": "Not specified"
+            }
+        
+        if "coverage_details" not in parsed_data:
+            parsed_data["coverage_details"] = ["Coverage details as outlined in the policy"]
+        
+        if "exclusions" not in parsed_data:
+            parsed_data["exclusions"] = ["Exclusions as specified in the policy"]
+    
+    elif normalized_type == "Memorandum of Understanding":
+        if "purpose" not in parsed_data and "parties" in parsed_data:
+            logger.warning("MOU detected but missing purpose, adding defaults")
+            parsed_data["purpose"] = {
+                "objective": "Collaborative objectives as outlined in the MOU",
+                "background": "Background context for the agreement",
+                "scope": "Scope as defined in the MOU"
+            }
+        
+        if "responsibilities" not in parsed_data:
+            parsed_data["responsibilities"] = {
+                "party_1_obligations": "Responsibilities of the first party",
+                "party_2_obligations": "Responsibilities of the second party",
+                "shared_responsibilities": "Joint obligations"
+            }
+    
     logger.info(f"Final document type: {normalized_type}")
     return parsed_data
 
@@ -780,20 +997,34 @@ def detect_document_type_by_keywords(document_text: str) -> str:
     msa_keywords = ["service agreement", "master service", "services", "deliverables", "statement of work", 
                    "service provider", "client", "professional services", "technical support"]
     
+    insurance_keywords = ["insurance", "policy", "coverage", "premium", "deductible", "claim", "insurer", 
+                         "policyholder", "benefits", "copayment", "coinsurance", "exclusions"]
+    
+    mou_keywords = ["memorandum", "understanding", "mou", "collaboration", "partnership", "cooperation", 
+                   "mutual", "parties agree", "objectives", "governance", "framework"]
+    
     rental_keywords = ["lease", "rental", "tenant", "landlord", "property", "premises", "rent", 
                       "security deposit", "tenancy", "lessor", "lessee"]
     
     nda_count = sum(1 for keyword in nda_keywords if keyword in text_lower)
     msa_count = sum(1 for keyword in msa_keywords if keyword in text_lower)
+    insurance_count = sum(1 for keyword in insurance_keywords if keyword in text_lower)
+    mou_count = sum(1 for keyword in mou_keywords if keyword in text_lower)
     rental_count = sum(1 for keyword in rental_keywords if keyword in text_lower)
     
-    logger.info(f"Keyword counts - NDA: {nda_count}, MSA: {msa_count}, Rental: {rental_count}")
+    logger.info(f"Keyword counts - NDA: {nda_count}, MSA: {msa_count}, Insurance: {insurance_count}, MOU: {mou_count}, Rental: {rental_count}")
     
     # Return the type with the highest keyword count
-    if nda_count >= msa_count and nda_count >= rental_count:
+    max_count = max(nda_count, msa_count, insurance_count, mou_count, rental_count)
+    
+    if max_count == nda_count:
         return "Non-Disclosure Agreement"
-    elif msa_count >= rental_count:
-        return "Master Service Agreement"  
+    elif max_count == msa_count:
+        return "Master Service Agreement"
+    elif max_count == insurance_count:
+        return "Insurance Policy"
+    elif max_count == mou_count:
+        return "Memorandum of Understanding"
     else:
         return "Rental Agreement"
 
@@ -810,6 +1041,10 @@ def extract_basic_info_manually(document_text: str, document_type: str = "Rental
         return extract_nda_info_manually(document_text)
     elif document_type == "MSA":
         return extract_msa_info_manually(document_text)
+    elif document_type == "Insurance":
+        return extract_insurance_info_manually(document_text)
+    elif document_type == "MOU":
+        return extract_mou_info_manually(document_text)
     else:
         return extract_rental_info_manually(document_text)  # Default
 
@@ -994,6 +1229,129 @@ def extract_msa_info_manually(document_text: str) -> Dict[str, Any]:
         ]
     }
 
+def extract_insurance_info_manually(document_text: str) -> Dict[str, Any]:
+    """Manual extraction for insurance policies"""
+    import re
+    
+    # Find policy number
+    policy_match = re.search(r'policy\s*(?:number|no\.?)\s*[:\-]?\s*([A-Z0-9\-]+)', document_text, re.IGNORECASE)
+    policy_number = policy_match.group(1).strip() if policy_match else "Not specified"
+    
+    # Find premium amount
+    premium_match = re.search(r'premium\s*[:\-]?\s*[$₹]?(\d+(?:,\d+)*(?:\.\d{2})?)', document_text, re.IGNORECASE)
+    premium_amount = f"${premium_match.group(1)}" if premium_match else "Not specified"
+    
+    # Find insurance company
+    insurer_match = re.search(r'([\w\s]+)\s*insurance\s*company', document_text, re.IGNORECASE)
+    insurer = insurer_match.group(1).strip() + " Insurance Company" if insurer_match else "Not specified"
+    
+    # Find policyholder
+    policyholder_match = re.search(r'policyholder[:\-]?\s*([A-Za-z\s]+)', document_text, re.IGNORECASE)
+    policyholder = policyholder_match.group(1).strip() if policyholder_match else "Not specified"
+    
+    # Find dates
+    start_date_match = re.search(r'effective\s*(?:date|from)[:\-]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})', document_text, re.IGNORECASE)
+    start_date = start_date_match.group(1).replace('/', '-') if start_date_match else "Not specified"
+    
+    return {
+        "document_type": "Insurance Policy",
+        "contract_summary": f"Insurance policy from {insurer} covering {policyholder} with premium {premium_amount}",
+        "parties": {
+            "insurer": insurer,
+            "policyholder": policyholder,
+            "beneficiary": "Not specified"
+        },
+        "policy_details": {
+            "policy_number": policy_number,
+            "insurance_type": "General insurance policy",
+            "coverage_amount": "As specified in the policy",
+            "deductible": "Not specified"
+        },
+        "financial_terms": {
+            "premium_amount": premium_amount,
+            "copayment": "Not specified",
+            "coinsurance": "Not specified",
+            "out_of_pocket_maximum": "Not specified"
+        },
+        "dates": {
+            "policy_start": start_date,
+            "policy_end": "Not specified",
+            "renewal_date": "Not specified",
+            "grace_period": "Not specified"
+        },
+        "coverage_details": [
+            "Coverage as outlined in the policy document"
+        ],
+        "exclusions": [
+            "Exclusions as specified in the policy terms"
+        ],
+        "claim_procedures": [
+            "Claim procedures as outlined in the policy"
+        ]
+    }
+
+def extract_mou_info_manually(document_text: str) -> Dict[str, Any]:
+    """Manual extraction for MOU documents"""
+    import re
+    
+    # Find parties (look for organization names)
+    parties_pattern = r'between\s+([^,\n]+)\s+and\s+([^,\n]+)'
+    parties_match = re.search(parties_pattern, document_text, re.IGNORECASE)
+    
+    if parties_match:
+        party_1 = parties_match.group(1).strip()
+        party_2 = parties_match.group(2).strip()
+    else:
+        party_1 = "Not specified"
+        party_2 = "Not specified"
+    
+    # Find execution date
+    exec_date_match = re.search(r'(?:signed|executed|dated)\s*(?:on)?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})', document_text, re.IGNORECASE)
+    execution_date = exec_date_match.group(1).replace('/', '-') if exec_date_match else "Not specified"
+    
+    # Find duration/term
+    duration_match = re.search(r'(?:term|duration|period)\s*(?:of)?\s*(\d+\s*(?:years?|months?))', document_text, re.IGNORECASE)
+    duration = duration_match.group(1) if duration_match else "Not specified"
+    
+    return {
+        "document_type": "Memorandum of Understanding",
+        "contract_summary": f"MOU between {party_1} and {party_2} for collaborative purposes",
+        "parties": {
+            "party_1": party_1,
+            "party_2": party_2,
+            "additional_parties": "Not specified"
+        },
+        "purpose": {
+            "objective": "Collaborative objectives as outlined in the MOU",
+            "background": "Background context for the partnership",
+            "scope": "Scope of cooperation as defined in the MOU"
+        },
+        "responsibilities": {
+            "party_1_obligations": f"Responsibilities of {party_1} as outlined in the MOU",
+            "party_2_obligations": f"Responsibilities of {party_2} as outlined in the MOU",
+            "shared_responsibilities": "Joint obligations and shared activities"
+        },
+        "dates": {
+            "execution_date": execution_date,
+            "effective_date": execution_date,
+            "duration": duration,
+            "review_date": "Not specified"
+        },
+        "key_terms": [
+            "Terms and conditions as outlined in the MOU",
+            "Mutual cooperation and collaboration",
+            "Periodic review and assessment"
+        ],
+        "termination_conditions": [
+            "Termination conditions as specified in the MOU",
+            "Mutual agreement termination provision"
+        ],
+        "governance": [
+            "Governance structure as defined in the MOU",
+            "Management and oversight procedures"
+        ]
+    }
+
 def month_to_number(month_name: str) -> str:
     """Convert month name to number"""
     months = {
@@ -1171,6 +1529,246 @@ def calculate_msa_expiry(data: Dict[str, Any]) -> tuple[Optional[int], Optional[
         logger.error(f"Error calculating MSA expiry: {str(e)}")
         return None, None
 
+def calculate_insurance_expiry(data: Dict[str, Any]) -> tuple[Optional[int], Optional[datetime]]:
+    """Calculate insurance policy expiry date"""
+    try:
+        dates = data.get("dates", {})
+        policy_end = dates.get("policy_end", "")
+        renewal_date = dates.get("renewal_date", "")
+        policy_start = dates.get("policy_start", "")
+        grace_period = dates.get("grace_period", "")
+        
+        # Use policy_end, then renewal_date
+        end_date_str = policy_end if policy_end != "Not specified" else renewal_date
+        
+        if end_date_str != "Not specified":
+            try:
+                end_date = parser.parse(end_date_str)
+                today = datetime.now()
+                days_left = (end_date - today).days
+                
+                logger.info(f"Insurance expiry calculated: {end_date.strftime('%Y-%m-%d')} ({days_left} days)")
+                return days_left, end_date
+            except:
+                pass
+        
+        # Calculate from start date + duration if available
+        if policy_start != "Not specified":
+            try:
+                start_date = parser.parse(policy_start)
+                
+                # Look for duration in various fields - check all date fields for duration info
+                duration_sources = [
+                    grace_period,
+                    dates.get("duration", ""),
+                    dates.get("term", ""),
+                    dates.get("policy_term", "")
+                ]
+                
+                # Also check in other data structures
+                policy_details = data.get("policy_details", {})
+                financial_terms = data.get("financial_terms", {})
+                
+                # Look for duration indicators in policy details or financial terms
+                duration_sources.extend([
+                    str(policy_details.get("coverage_period", "")),
+                    str(financial_terms.get("premium_frequency", "")),
+                    str(financial_terms.get("payment_frequency", ""))
+                ])
+                
+                import re
+                end_date = None
+                
+                for duration_text in duration_sources:
+                    if duration_text and duration_text != "Not specified":
+                        logger.info(f"Trying to parse duration from: {duration_text}")
+                        
+                        # Look for year patterns
+                        year_match = re.search(r'(\d+)\s*years?', duration_text.lower())
+                        if year_match:
+                            years = int(year_match.group(1))
+                            end_date = start_date + relativedelta(years=years)
+                            logger.info(f"Found {years} year(s) duration, calculated end date: {end_date}")
+                            break
+                        
+                        # Look for month patterns
+                        month_match = re.search(r'(\d+)\s*months?', duration_text.lower())
+                        if month_match:
+                            months = int(month_match.group(1))
+                            end_date = start_date + relativedelta(months=months)
+                            logger.info(f"Found {months} month(s) duration, calculated end date: {end_date}")
+                            break
+                        
+                        # Look for "one year", "two years", etc.
+                        if "one year" in duration_text.lower() or "1 year" in duration_text.lower():
+                            end_date = start_date + relativedelta(years=1)
+                            logger.info(f"Found 'one year' duration, calculated end date: {end_date}")
+                            break
+                        
+                        # Check for annual/yearly indicators
+                        if any(word in duration_text.lower() for word in ["annual", "yearly", "per year"]):
+                            end_date = start_date + relativedelta(years=1)
+                            logger.info(f"Found annual indicator, calculated end date: {end_date}")
+                            break
+                
+                # Default fallback: assume 1 year for insurance policies
+                if end_date is None:
+                    end_date = start_date + relativedelta(years=1)
+                    logger.info(f"No duration found, defaulting to 1 year: {end_date}")
+                
+                today = datetime.now()
+                days_left = (end_date - today).days
+                
+                logger.info(f"Insurance expiry calculated from start date + duration: {end_date.strftime('%Y-%m-%d')} ({days_left} days)")
+                return days_left, end_date
+                
+            except Exception as calc_error:
+                logger.error(f"Error calculating from start date: {calc_error}")
+        
+        logger.warning("Could not calculate insurance expiry date")
+        return None, None
+            
+    except Exception as e:
+        logger.error(f"Error calculating insurance expiry: {str(e)}")
+        return None, None
+
+def calculate_end_date_from_duration(start_date_str: str, duration_text: str) -> Optional[datetime]:
+    """Universal function to calculate end date from start date + duration text"""
+    if not start_date_str or start_date_str == "Not specified":
+        return None
+    if not duration_text or duration_text == "Not specified":
+        return None
+    
+    try:
+        start_date = parser.parse(start_date_str)
+        duration_lower = duration_text.lower()
+        
+        import re
+        
+        # Look for specific year patterns
+        year_patterns = [
+            r'(\d+)\s*years?',
+            r'(?:one|1)\s*years?',
+            r'(?:two|2)\s*years?',
+            r'(?:three|3)\s*years?',
+            r'(?:four|4)\s*years?',
+            r'(?:five|5)\s*years?'
+        ]
+        
+        for pattern in year_patterns:
+            match = re.search(pattern, duration_lower)
+            if match:
+                if pattern.startswith(r'(\d+)'):
+                    years = int(match.group(1))
+                elif 'one' in pattern or '1' in pattern:
+                    years = 1
+                elif 'two' in pattern or '2' in pattern:
+                    years = 2
+                elif 'three' in pattern or '3' in pattern:
+                    years = 3
+                elif 'four' in pattern or '4' in pattern:
+                    years = 4
+                elif 'five' in pattern or '5' in pattern:
+                    years = 5
+                else:
+                    continue
+                
+                end_date = start_date + relativedelta(years=years)
+                logger.info(f"Calculated end date from {years} year(s): {end_date}")
+                return end_date
+        
+        # Look for month patterns
+        month_patterns = [
+            r'(\d+)\s*months?',
+            r'(?:eleven|11)\s*months?',
+            r'(?:twelve|12)\s*months?',
+            r'(?:six|6)\s*months?'
+        ]
+        
+        for pattern in month_patterns:
+            match = re.search(pattern, duration_lower)
+            if match:
+                if pattern.startswith(r'(\d+)'):
+                    months = int(match.group(1))
+                elif 'eleven' in pattern or '11' in pattern:
+                    months = 11
+                elif 'twelve' in pattern or '12' in pattern:
+                    months = 12
+                elif 'six' in pattern or '6' in pattern:
+                    months = 6
+                else:
+                    continue
+                
+                end_date = start_date + relativedelta(months=months)
+                logger.info(f"Calculated end date from {months} month(s): {end_date}")
+                return end_date
+        
+        # Check for common duration keywords
+        if any(word in duration_lower for word in ["annual", "yearly", "per year", "one year"]):
+            end_date = start_date + relativedelta(years=1)
+            logger.info(f"Calculated end date from annual term: {end_date}")
+            return end_date
+        
+        logger.warning(f"Could not parse duration: {duration_text}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error calculating end date from duration: {str(e)}")
+        return None
+
+def calculate_mou_expiry(data: Dict[str, Any]) -> tuple[Optional[int], Optional[datetime]]:
+    """Calculate MOU expiry date based on duration and start date"""
+    try:
+        dates = data.get("dates", {})
+        duration = dates.get("duration", "")
+        execution_date = dates.get("execution_date", "")
+        effective_date = dates.get("effective_date", "")
+        review_date = dates.get("review_date", "")
+        
+        # Use effective date or execution date as start date
+        start_date_str = effective_date if effective_date != "Not specified" else execution_date
+        
+        # If review_date is specified, use that as the expiry
+        if review_date != "Not specified":
+            try:
+                end_date = parser.parse(review_date)
+                today = datetime.now()
+                days_left = (end_date - today).days
+                
+                logger.info(f"MOU review date: {end_date.strftime('%Y-%m-%d')} ({days_left} days)")
+                return days_left, end_date
+            except:
+                pass
+        
+        # Calculate from start date + duration using universal function
+        if start_date_str != "Not specified" and duration != "Not specified":
+            end_date = calculate_end_date_from_duration(start_date_str, duration)
+            if end_date:
+                today = datetime.now()
+                days_left = (end_date - today).days
+                
+                logger.info(f"MOU expiry calculated: {end_date.strftime('%Y-%m-%d')} ({days_left} days)")
+                return days_left, end_date
+        
+        # Check if duration info is in other fields
+        purpose = data.get("purpose", {})
+        if isinstance(purpose, dict):
+            for key, value in purpose.items():
+                if value and value != "Not specified":
+                    calculated_end = calculate_end_date_from_duration(start_date_str, str(value))
+                    if calculated_end:
+                        today = datetime.now()
+                        days_left = (calculated_end - today).days
+                        logger.info(f"MOU expiry calculated from purpose field: {calculated_end.strftime('%Y-%m-%d')} ({days_left} days)")
+                        return days_left, calculated_end
+        
+        logger.warning("Could not calculate MOU expiry date")
+        return None, None
+            
+    except Exception as e:
+        logger.error(f"Error calculating MOU expiry: {str(e)}")
+        return None, None
+
 def display_minimal_contract_info(data: Optional[Dict[str, Any]]) -> None:
     """Display minimal contract information: Start Date, End Date, Document Type only"""
     logger.info("Displaying minimal contract information")
@@ -1184,7 +1782,11 @@ def display_minimal_contract_info(data: Optional[Dict[str, Any]]) -> None:
     dates = data.get("dates", {})
     
     # Get start date
-    start_date = dates.get("start_date") or dates.get("effective_date") or dates.get("execution_date") or "Not specified"
+    start_date = (dates.get("start_date") or 
+                 dates.get("effective_date") or 
+                 dates.get("execution_date") or 
+                 dates.get("policy_start") or 
+                 "Not specified")
     
     # Get or calculate end date based on document type
     end_date = "Not specified"
@@ -1192,6 +1794,15 @@ def display_minimal_contract_info(data: Optional[Dict[str, Any]]) -> None:
     
     if "Rental" in document_type:
         end_date = dates.get("end_date", "Not specified")
+        # If no end date but we have start date and lease term, calculate it
+        if end_date == "Not specified" and start_date != "Not specified":
+            lease_term = dates.get("lease_term", "")
+            if lease_term != "Not specified":
+                calculated_end = calculate_end_date_from_duration(start_date, lease_term)
+                if calculated_end:
+                    end_date = calculated_end.strftime('%Y-%m-%d')
+                    logger.info(f"Calculated rental end date from lease term: {end_date}")
+        
         if end_date != "Not specified":
             try:
                 end_dt = parser.parse(end_date)
@@ -1211,6 +1822,84 @@ def display_minimal_contract_info(data: Optional[Dict[str, Any]]) -> None:
         if calculated_end_date is not None:
             end_date = calculated_end_date.strftime('%Y-%m-%d')
             days_remaining = days_left
+        # If calculation failed but we have start date and initial term, try universal calculation
+        elif end_date == "Not specified" and start_date != "Not specified":
+            initial_term = dates.get("initial_term", "")
+            if initial_term != "Not specified":
+                calculated_end = calculate_end_date_from_duration(start_date, initial_term)
+                if calculated_end:
+                    end_date = calculated_end.strftime('%Y-%m-%d')
+                    today = datetime.now()
+                    days_remaining = (calculated_end - today).days
+                    logger.info(f"Calculated MSA end date from initial term: {end_date}")
+    
+    elif "Insurance" in document_type:
+        days_left, calculated_end_date = calculate_insurance_expiry(data)
+        if calculated_end_date is not None:
+            end_date = calculated_end_date.strftime('%Y-%m-%d')
+            days_remaining = days_left
+        # Additional fallback for insurance - check various duration fields
+        elif end_date == "Not specified" and start_date != "Not specified":
+            # Try different duration sources
+            duration_sources = [
+                dates.get("grace_period", ""),
+                dates.get("policy_term", ""),
+                dates.get("duration", "")
+            ]
+            
+            # Check policy details for duration info
+            policy_details = data.get("policy_details", {})
+            if isinstance(policy_details, dict):
+                duration_sources.extend([
+                    str(policy_details.get("coverage_period", "")),
+                    str(policy_details.get("term", ""))
+                ])
+            
+            for duration_text in duration_sources:
+                if duration_text and duration_text != "Not specified":
+                    calculated_end = calculate_end_date_from_duration(start_date, duration_text)
+                    if calculated_end:
+                        end_date = calculated_end.strftime('%Y-%m-%d')
+                        today = datetime.now()
+                        days_remaining = (calculated_end - today).days
+                        logger.info(f"Calculated insurance end date from duration: {end_date}")
+                        break
+    
+    elif "Memorandum" in document_type or "MOU" in document_type:
+        days_left, calculated_end_date = calculate_mou_expiry(data)
+        if calculated_end_date is not None:
+            end_date = calculated_end_date.strftime('%Y-%m-%d')
+            days_remaining = days_left
+        # If calculation failed but we have start date and duration, try universal calculation
+        elif end_date == "Not specified" and start_date != "Not specified":
+            duration = dates.get("duration", "")
+            if duration != "Not specified":
+                calculated_end = calculate_end_date_from_duration(start_date, duration)
+                if calculated_end:
+                    end_date = calculated_end.strftime('%Y-%m-%d')
+                    today = datetime.now()
+                    days_remaining = (calculated_end - today).days
+                    logger.info(f"Calculated MOU end date from duration: {end_date}")
+    
+    # Universal fallback for any document type with start date and duration
+    if end_date == "Not specified" and start_date != "Not specified":
+        # Try to find duration in various common fields
+        duration_fields = [
+            dates.get("duration", ""),
+            dates.get("term", ""),
+            dates.get("period", ""),
+            dates.get("validity", "")
+        ]
+        
+        for duration_text in duration_fields:
+            if duration_text and duration_text != "Not specified":
+                calculated_end = calculate_end_date_from_duration(start_date, duration_text)
+                if calculated_end:
+                    end_date = calculated_end.strftime('%Y-%m-%d')
+                    today = datetime.now()
+                    days_remaining = (calculated_end - today).days
+                    logger.info(f"Calculated end date using universal fallback: {end_date}")
+                    break
     
     # Display the minimal info in a clean format
     col1, col2, col3 = st.columns(3)
@@ -1230,11 +1919,20 @@ def display_minimal_contract_info(data: Optional[Dict[str, Any]]) -> None:
             else:
                 st.metric("❌ End Date", end_date, f"Expired {abs(days_remaining)} days ago", delta_color="inverse")
         else:
-            st.metric("📅 End Date", end_date if end_date != "Not specified" else "Not found")
+            # Show calculated end date even without days remaining if we calculated it
+            if end_date != "Not specified":
+                st.metric("📅 End Date", end_date, "Calculated from duration")
+            else:
+                st.metric("📅 End Date", "Not found")
     
     with col3:
         # Clean up document type for display
-        clean_type = document_type.replace("Agreement", "").replace("Non-Disclosure", "NDA").replace("Master Service", "MSA").strip()
+        clean_type = (document_type.replace("Agreement", "")
+                                  .replace("Non-Disclosure", "NDA")
+                                  .replace("Master Service", "MSA")
+                                  .replace("Memorandum of Understanding", "MOU")
+                                  .replace("Policy", "")
+                                  .strip())
         st.metric("📄 Document Type", clean_type)
     
     logger.info("Minimal contract information displayed successfully")
@@ -1262,6 +1960,29 @@ def create_brief_summary(data: Dict[str, Any], document_type: str) -> str:
         
         return f"""This Master Service Agreement is between {provider} (service provider) and {client} (client). The provider will deliver {services} under the terms and conditions outlined in the agreement. The contract has an initial term of {term} and covers service delivery, payment terms, and responsibilities of both parties."""
     
+    elif "Insurance" in document_type:
+        parties = data.get("parties", {})
+        insurer = parties.get("insurer", "Insurance Company")
+        policyholder = parties.get("policyholder", "Policyholder")
+        policy_details = data.get("policy_details", {})
+        insurance_type = policy_details.get("insurance_type", "insurance coverage")
+        coverage_amount = policy_details.get("coverage_amount", "specified coverage")
+        financial = data.get("financial_terms", {})
+        premium = financial.get("premium_amount", "agreed premium")
+        
+        return f"""This insurance policy is between {insurer} (insurer) and {policyholder} (policyholder). The policy provides {insurance_type} with {coverage_amount} coverage. The policyholder pays {premium} in premiums and the policy outlines covered benefits, exclusions, and claim procedures."""
+    
+    elif "Memorandum" in document_type or "MOU" in document_type:
+        parties = data.get("parties", {})
+        party_1 = parties.get("party_1", "First Party")
+        party_2 = parties.get("party_2", "Second Party")
+        purpose = data.get("purpose", {})
+        objective = purpose.get("objective", "collaborative objectives")
+        dates = data.get("dates", {})
+        duration = dates.get("duration", "specified period")
+        
+        return f"""This Memorandum of Understanding is between {party_1} and {party_2} for {objective}. The MOU establishes a framework for cooperation and collaboration between the parties. The agreement lasts for {duration} and outlines the responsibilities, governance structure, and terms of the partnership."""
+    
     else:  # Rental
         parties = data.get("parties", {})
         landlord = parties.get("landlord", "Landlord")
@@ -1274,8 +1995,6 @@ def create_brief_summary(data: Dict[str, Any], document_type: str) -> str:
         term = dates.get("lease_term", "specified period")
         
         return f"""This rental agreement is between {landlord} (landlord) and {tenant} (tenant) for the property located at {address}. The lease term is {term} with monthly rent of {rent}. The agreement outlines the rights, responsibilities, and obligations of both landlord and tenant during the rental period."""
-
-
 
 def get_relevant_context(question: str, contract_data: Dict[str, Any]) -> str:
     """Get only relevant contract data based on the question type"""
@@ -1294,12 +2013,12 @@ def get_relevant_context(question: str, contract_data: Dict[str, Any]) -> str:
             relevant_data["dates"] = contract_data["dates"]
     
     # Financial questions  
-    if any(word in question_lower for word in ["rent", "money", "cost", "pay", "amount", "price", "fee"]):
+    if any(word in question_lower for word in ["rent", "money", "cost", "pay", "amount", "price", "fee", "premium", "deductible"]):
         if "financial_terms" in contract_data:
             relevant_data["financial_terms"] = contract_data["financial_terms"]
     
     # Party/people questions
-    if any(word in question_lower for word in ["who", "landlord", "tenant", "owner", "lessee", "lessor", "name"]):
+    if any(word in question_lower for word in ["who", "landlord", "tenant", "owner", "lessee", "lessor", "name", "insurer", "policyholder"]):
         if "parties" in contract_data:
             relevant_data["parties"] = contract_data["parties"]
     
@@ -1314,6 +2033,24 @@ def get_relevant_context(question: str, contract_data: Dict[str, Any]) -> str:
             relevant_data["key_terms"] = contract_data["key_terms"]
         if "special_clauses" in contract_data:
             relevant_data["special_clauses"] = contract_data["special_clauses"]
+    
+    # Insurance-specific questions
+    if any(word in question_lower for word in ["coverage", "covered", "exclude", "claim", "benefit"]):
+        if "coverage_details" in contract_data:
+            relevant_data["coverage_details"] = contract_data["coverage_details"]
+        if "exclusions" in contract_data:
+            relevant_data["exclusions"] = contract_data["exclusions"]
+        if "claim_procedures" in contract_data:
+            relevant_data["claim_procedures"] = contract_data["claim_procedures"]
+    
+    # MOU-specific questions
+    if any(word in question_lower for word in ["purpose", "objective", "responsibility", "obligation", "governance"]):
+        if "purpose" in contract_data:
+            relevant_data["purpose"] = contract_data["purpose"]
+        if "responsibilities" in contract_data:
+            relevant_data["responsibilities"] = contract_data["responsibilities"]
+        if "governance" in contract_data:
+            relevant_data["governance"] = contract_data["governance"]
     
     # If no specific context found, include essential data
     if not relevant_data:
@@ -1384,6 +2121,36 @@ def answer_question_locally(question: str, contract_data: Dict[str, Any]) -> Opt
                     end_time = time.perf_counter()
                     logger.info(f"⚡ Local answer (client): {(end_time - start_time) * 1000:.2f}ms")
                     return f"The company buying the services is: {client}"
+            
+            # Insurance-specific
+            if "insurer" in question_lower or "insurance company" in question_lower:
+                insurer = parties.get("insurer", "Not specified")
+                if insurer != "Not specified":
+                    end_time = time.perf_counter()
+                    logger.info(f"⚡ Local answer (insurer): {(end_time - start_time) * 1000:.2f}ms")
+                    return f"The insurance company is: {insurer}"
+            
+            if "policyholder" in question_lower or "insured" in question_lower:
+                policyholder = parties.get("policyholder", "Not specified")
+                if policyholder != "Not specified":
+                    end_time = time.perf_counter()
+                    logger.info(f"⚡ Local answer (policyholder): {(end_time - start_time) * 1000:.2f}ms")
+                    return f"The person being insured is: {policyholder}"
+            
+            # MOU-specific
+            if "first party" in question_lower or "party 1" in question_lower:
+                party_1 = parties.get("party_1", "Not specified")
+                if party_1 != "Not specified":
+                    end_time = time.perf_counter()
+                    logger.info(f"⚡ Local answer (party 1): {(end_time - start_time) * 1000:.2f}ms")
+                    return f"The first party is: {party_1}"
+            
+            if "second party" in question_lower or "party 2" in question_lower:
+                party_2 = parties.get("party_2", "Not specified")
+                if party_2 != "Not specified":
+                    end_time = time.perf_counter()
+                    logger.info(f"⚡ Local answer (party 2): {(end_time - start_time) * 1000:.2f}ms")
+                    return f"The second party is: {party_2}"
         
         # Universal WHEN questions (works for all document types)
         if any(word in question_lower for word in ["when", "expire", "end", "start", "date"]):
@@ -1488,15 +2255,151 @@ def answer_question_locally(question: str, contract_data: Dict[str, Any]) -> Opt
                         if initial_term != "Not specified":
                             return f"The service agreement lasts for {initial_term}."
                 
+                elif "Insurance" in document_type:
+                    # For Insurance policies, calculate expiry from policy dates
+                    days_left, calculated_end_date = calculate_insurance_expiry(contract_data)
+                    if days_left is not None and calculated_end_date is not None:
+                        end_time = time.perf_counter()
+                        logger.info(f"⚡ Local answer (Insurance expiry): {(end_time - start_time) * 1000:.2f}ms")
+                        
+                        if days_left > 0:
+                            return f"The insurance policy expires on {calculated_end_date.strftime('%Y-%m-%d')} - that's {days_left} days from now."
+                        else:
+                            return f"The insurance policy already expired on {calculated_end_date.strftime('%Y-%m-%d')} - that was {abs(days_left)} days ago."
+                    else:
+                        # Try fallback calculation with start date + duration
+                        policy_start = dates.get("policy_start", "Not specified")
+                        if policy_start != "Not specified":
+                            # Try various duration sources
+                            duration_sources = [
+                                dates.get("grace_period", ""),
+                                dates.get("policy_term", ""),
+                                dates.get("duration", "")
+                            ]
+                            
+                            for duration_text in duration_sources:
+                                if duration_text and duration_text != "Not specified":
+                                    calculated_end = calculate_end_date_from_duration(policy_start, duration_text)
+                                    if calculated_end:
+                                        today = datetime.now()
+                                        days_left = (calculated_end - today).days
+                                        
+                                        end_time = time.perf_counter()
+                                        logger.info(f"⚡ Local answer (Insurance calculated expiry): {(end_time - start_time) * 1000:.2f}ms")
+                                        
+                                        if days_left > 0:
+                                            return f"Based on the policy start date and duration, your insurance expires on {calculated_end.strftime('%Y-%m-%d')} - that's {days_left} days from now."
+                                        else:
+                                            return f"Based on the policy start date and duration, your insurance expired on {calculated_end.strftime('%Y-%m-%d')} - that was {abs(days_left)} days ago."
+                            
+                            # Ultimate fallback for insurance - assume 1 year
+                            calculated_end = calculate_end_date_from_duration(policy_start, "1 year")
+                            if calculated_end:
+                                today = datetime.now()
+                                days_left = (calculated_end - today).days
+                                
+                                end_time = time.perf_counter()
+                                logger.info(f"⚡ Local answer (Insurance 1-year fallback): {(end_time - start_time) * 1000:.2f}ms")
+                                
+                                if days_left > 0:
+                                    return f"Assuming a standard 1-year policy, your insurance expires on {calculated_end.strftime('%Y-%m-%d')} - that's {days_left} days from now."
+                                else:
+                                    return f"Assuming a standard 1-year policy, your insurance expired on {calculated_end.strftime('%Y-%m-%d')} - that was {abs(days_left)} days ago."
+                        
+                        # Final fallback
+                        policy_end = dates.get("policy_end", "Not specified")
+                        if policy_end != "Not specified":
+                            return f"The insurance policy expires on {policy_end}."
+                        else:
+                            return "The policy expiry date is not clearly specified in the document."
+                
+                elif "Memorandum" in document_type or "MOU" in document_type:
+                    # For MOUs, calculate expiry or review date
+                    days_left, calculated_end_date = calculate_mou_expiry(contract_data)
+                    if days_left is not None and calculated_end_date is not None:
+                        end_time = time.perf_counter()
+                        logger.info(f"⚡ Local answer (MOU expiry): {(end_time - start_time) * 1000:.2f}ms")
+                        
+                        if days_left > 0:
+                            return f"The MOU is scheduled for review/expiry on {calculated_end_date.strftime('%Y-%m-%d')} - that's {days_left} days from now."
+                        else:
+                            return f"The MOU review/expiry date was {calculated_end_date.strftime('%Y-%m-%d')} - that was {abs(days_left)} days ago."
+                    else:
+                        # Try fallback calculation with start date + duration
+                        execution_date = dates.get("execution_date", "Not specified")
+                        effective_date = dates.get("effective_date", "Not specified")
+                        start_date_str = effective_date if effective_date != "Not specified" else execution_date
+                        
+                        if start_date_str != "Not specified":
+                            duration = dates.get("duration", "Not specified")
+                            if duration != "Not specified":
+                                calculated_end = calculate_end_date_from_duration(start_date_str, duration)
+                                if calculated_end:
+                                    today = datetime.now()
+                                    days_left = (calculated_end - today).days
+                                    
+                                    end_time = time.perf_counter()
+                                    logger.info(f"⚡ Local answer (MOU calculated expiry): {(end_time - start_time) * 1000:.2f}ms")
+                                    
+                                    if days_left > 0:
+                                        return f"Based on the start date and duration, the MOU expires on {calculated_end.strftime('%Y-%m-%d')} - that's {days_left} days from now."
+                                    else:
+                                        return f"Based on the start date and duration, the MOU expired on {calculated_end.strftime('%Y-%m-%d')} - that was {abs(days_left)} days ago."
+                        
+                        # Fallback to duration text
+                        duration = dates.get("duration", "Not specified")
+                        if duration != "Not specified":
+                            return f"The MOU lasts for {duration}."
+                        else:
+                            return "The MOU duration is not clearly specified in the document."
+                
                 # Generic fallback for any document type
-                end_date = dates.get("end_date") or dates.get("duration") or "Not specified"
+                end_date = dates.get("end_date") or dates.get("policy_end") or "Not specified"
                 if end_date != "Not specified":
                     end_time = time.perf_counter()
                     logger.info(f"⚡ Local answer (generic expiry): {(end_time - start_time) * 1000:.2f}ms")
                     return f"The agreement runs out on {end_date}."
+                
+                # Universal fallback: try to calculate from any start date + duration
+                start_date_options = [
+                    dates.get("start_date", ""),
+                    dates.get("effective_date", ""),
+                    dates.get("execution_date", ""),
+                    dates.get("policy_start", "")
+                ]
+                
+                duration_options = [
+                    dates.get("duration", ""),
+                    dates.get("term", ""),
+                    dates.get("lease_term", ""),
+                    dates.get("initial_term", ""),
+                    dates.get("policy_term", ""),
+                    dates.get("period", "")
+                ]
+                
+                for start_date_str in start_date_options:
+                    if start_date_str and start_date_str != "Not specified":
+                        for duration_text in duration_options:
+                            if duration_text and duration_text != "Not specified":
+                                calculated_end = calculate_end_date_from_duration(start_date_str, duration_text)
+                                if calculated_end:
+                                    today = datetime.now()
+                                    days_left = (calculated_end - today).days
+                                    
+                                    end_time = time.perf_counter()
+                                    logger.info(f"⚡ Local answer (universal calculated expiry): {(end_time - start_time) * 1000:.2f}ms")
+                                    
+                                    if days_left > 0:
+                                        return f"Based on the start date and duration, this agreement expires on {calculated_end.strftime('%Y-%m-%d')} - that's {days_left} days from now."
+                                    else:
+                                        return f"Based on the start date and duration, this agreement expired on {calculated_end.strftime('%Y-%m-%d')} - that was {abs(days_left)} days ago."
             
             if "start" in question_lower or "effective" in question_lower:
-                start_date = dates.get("start_date") or dates.get("effective_date") or dates.get("execution_date") or "Not specified"
+                start_date = (dates.get("start_date") or 
+                             dates.get("effective_date") or 
+                             dates.get("execution_date") or 
+                             dates.get("policy_start") or 
+                             "Not specified")
                 if start_date != "Not specified":
                     end_time = time.perf_counter()
                     logger.info(f"⚡ Local answer (start): {(end_time - start_time) * 1000:.2f}ms")
@@ -1529,6 +2432,23 @@ def answer_question_locally(question: str, contract_data: Dict[str, Any]) -> Opt
                         end_time = time.perf_counter()
                         logger.info(f"⚡ Local answer (payment terms): {(end_time - start_time) * 1000:.2f}ms")
                         return f"Here's how payments work: {payment_terms}."
+            
+            elif "Insurance" in document_type:
+                financial = contract_data.get("financial_terms", {})
+                if "premium" in question_lower:
+                    premium = financial.get("premium_amount", "Not specified")
+                    if premium != "Not specified":
+                        end_time = time.perf_counter()
+                        logger.info(f"⚡ Local answer (premium): {(end_time - start_time) * 1000:.2f}ms")
+                        return f"The insurance premium is {premium}."
+                
+                if "deductible" in question_lower:
+                    policy_details = contract_data.get("policy_details", {})
+                    deductible = policy_details.get("deductible", "Not specified")
+                    if deductible != "Not specified":
+                        end_time = time.perf_counter()
+                        logger.info(f"⚡ Local answer (deductible): {(end_time - start_time) * 1000:.2f}ms")
+                        return f"The deductible amount is {deductible}."
         
         # Location questions (mainly for rental)
         if any(word in question_lower for word in ["where", "address", "location", "property"]):
@@ -1571,6 +2491,47 @@ def answer_question_locally(question: str, contract_data: Dict[str, Any]) -> Opt
                 end_time = time.perf_counter()
                 logger.info(f"⚡ Local answer (services): {(end_time - start_time) * 1000:.2f}ms")
                 return f"Here's what services are being provided: {description}"
+        
+        # Insurance-specific questions
+        if "covered" in question_lower and "Insurance" in document_type:
+            coverage_details = contract_data.get("coverage_details", [])
+            if coverage_details and coverage_details != ["Not specified"]:
+                end_time = time.perf_counter()
+                logger.info(f"⚡ Local answer (coverage): {(end_time - start_time) * 1000:.2f}ms")
+                return f"Here's what's covered: {', '.join(coverage_details)}"
+        
+        if "excluded" in question_lower or "exclusion" in question_lower and "Insurance" in document_type:
+            exclusions = contract_data.get("exclusions", [])
+            if exclusions and exclusions != ["Not specified"]:
+                end_time = time.perf_counter()
+                logger.info(f"⚡ Local answer (exclusions): {(end_time - start_time) * 1000:.2f}ms")
+                return f"Here's what's NOT covered: {', '.join(exclusions)}"
+        
+        if "policy number" in question_lower and "Insurance" in document_type:
+            policy_details = contract_data.get("policy_details", {})
+            policy_number = policy_details.get("policy_number", "Not specified")
+            if policy_number != "Not specified":
+                end_time = time.perf_counter()
+                logger.info(f"⚡ Local answer (policy number): {(end_time - start_time) * 1000:.2f}ms")
+                return f"The policy number is: {policy_number}"
+        
+        # MOU-specific questions
+        if "purpose" in question_lower and "MOU" in document_type:
+            purpose = contract_data.get("purpose", {})
+            objective = purpose.get("objective", "Not specified")
+            if objective != "Not specified":
+                end_time = time.perf_counter()
+                logger.info(f"⚡ Local answer (MOU purpose): {(end_time - start_time) * 1000:.2f}ms")
+                return f"The purpose of this MOU is: {objective}"
+        
+        if "responsibility" in question_lower or "obligation" in question_lower and "MOU" in document_type:
+            responsibilities = contract_data.get("responsibilities", {})
+            party_1_obs = responsibilities.get("party_1_obligations", "Not specified")
+            party_2_obs = responsibilities.get("party_2_obligations", "Not specified")
+            if party_1_obs != "Not specified" and party_2_obs != "Not specified":
+                end_time = time.perf_counter()
+                logger.info(f"⚡ Local answer (MOU responsibilities): {(end_time - start_time) * 1000:.2f}ms")
+                return f"Responsibilities: Party 1 - {party_1_obs}. Party 2 - {party_2_obs}"
         
         # If no local answer found
         end_time = time.perf_counter()
@@ -1717,7 +2678,7 @@ def chat_with_document(question: str, contract_data: Dict[str, Any], document_te
 
 def main():
     st.title("📄 Multi-Document Contract Analyzer")
-    st.markdown("Upload your contracts (Rental, NDA, MSA) and get comprehensive analysis with Q&A capabilities")
+    st.markdown("Upload your contracts (Rental, NDA, MSA, Insurance, MOU) and get comprehensive analysis with Q&A capabilities")
     
     logger.info("Main application interface loaded")
     
@@ -1736,7 +2697,7 @@ def main():
     with col1:
         document_type = st.selectbox(
             "📋 Document Type",
-            ["Rental", "NDA", "MSA"],
+            ["Rental", "NDA", "MSA", "Insurance", "MOU"],
             help="Select the type of contract you're uploading"
         )
     
@@ -1769,16 +2730,16 @@ def main():
             
             logger.info("Processing new file or file not in session state")
             
-            # # Show extraction method being used
-            # if uploaded_file.type == "application/pdf":
-            #     extraction_method = "🚀 2-Layer Processing: PyMuPDF → OpenAI Vision API (No OCR)"
-            # else:
-            #     extraction_method = "📄 Standard Processing for Non-PDF Files"
+            # Show extraction method being used
+            if uploaded_file.type == "application/pdf":
+                extraction_method = "🚀 Threaded PDF Processing: PyMuPDF → Parallel OCR → Parallel Vision API"
+            else:
+                extraction_method = "📄 Standard Processing for Non-PDF Files"
             
-            # st.info(f"🔄 **Extraction Method:** {extraction_method}")
+            st.info(f"🔄 **Extraction Method:** {extraction_method}")
             
             # Process the document with optimized extraction
-            with st.spinner("🚀 Processing document with 2-layer extraction..."):
+            with st.spinner("🚀 Processing document with optimized extraction..."):
                 # Create a progress placeholder
                 progress_placeholder = st.empty()
                 status_placeholder = st.empty()
@@ -1792,10 +2753,10 @@ def main():
                     # For PDFs, try threaded processing if PyMuPDF available
                     try:
                         import fitz
-                        status_placeholder.info("🚀 **Using 2-layer threaded PDF processing...**")
+                        status_placeholder.info("🚀 **Using threaded PDF processing...**")
                         document_text = extract_text_from_file_threaded(uploaded_file)
                     except ImportError:
-                        status_placeholder.info("📄 **Using 2-layer standard PDF processing...**")
+                        status_placeholder.info("📄 **Using standard PDF processing...**")
                         document_text = extract_text_from_file(uploaded_file)
                 else:
                     # For non-PDFs, use standard processing
@@ -1867,7 +2828,7 @@ def main():
             
             # PROMINENT CHAT INTERFACE
             st.subheader("💬 Ask Questions About the Document")
-            st.info(f"🚀 **Smart Chat**: Get instant answers about your {document_type.replace('Agreement', '').strip()}!")
+            st.info(f"🚀 **Smart Chat**: Get instant answers about your {document_type.replace('Agreement', '').replace('Policy', '').strip()}!")
             
             # Document-specific example questions
             if "Rental" in document_type:
@@ -1876,6 +2837,10 @@ def main():
                 placeholder_text = "e.g., Who is the disclosing party? What are confidentiality exceptions?"
             elif "MSA" in document_type or "Master Service" in document_type:
                 placeholder_text = "e.g., Who is the service provider? What are termination conditions?"
+            elif "Insurance" in document_type:
+                placeholder_text = "e.g., What is covered? When does my policy expire? What's my deductible?"
+            elif "MOU" in document_type or "Memorandum" in document_type:
+                placeholder_text = "e.g., What is the purpose? Who are the parties? What are the responsibilities?"
             else:
                 placeholder_text = "Ask any question about the document..."
             
@@ -1930,6 +2895,32 @@ def main():
         logger.info("No file uploaded yet")
         st.info("👆 Please select document type and upload a contract to get started")
         
+        # Show supported formats
+        with st.expander("📋 Supported Document Types & Formats"):
+            st.markdown("""
+            **📄 Document Types:**
+            - **🏠 Rental Agreements** - Lease contracts, property rentals, commercial leases
+            - **🔒 NDAs** - Non-disclosure agreements, confidentiality contracts
+            - **📋 MSAs** - Master service agreements, service contracts, vendor agreements
+            - **🏥 Insurance Policies** - Health, auto, life, property insurance policies
+            - **🤝 MOUs** - Memorandums of understanding, partnership agreements
+            
+            **📁 File Formats:**
+            - **PDF files** (.pdf) - Including scanned documents with OCR
+            - **Word documents** (.docx) - Microsoft Word format
+            - **Text files** (.txt) - Plain text format
+            - **Images** (.jpg, .jpeg, .png, .tiff) - Uses OCR for text extraction
+            """)
+            
+            st.markdown("""
+            **🎯 What We Extract:**
+            - **Rental:** Parties, property details, rent amounts, lease terms, dates
+            - **NDA:** Confidentiality scope, parties, duration, obligations, restrictions  
+            - **MSA:** Service details, payment terms, parties, termination clauses
+            - **Insurance:** Coverage details, premiums, deductibles, policy terms, exclusions
+            - **MOU:** Purpose, parties, responsibilities, governance, collaboration terms
+            """)
+    
     
 if __name__ == "__main__":
     main()
